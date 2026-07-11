@@ -32,6 +32,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,7 +40,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 SUPPORTED_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://")
-SCANNER_VERSION = "1.0.0"
+SCANNER_VERSION = "1.1.0"
 UTC = dt.timezone.utc
 
 
@@ -190,6 +191,7 @@ class TestResult:
     speed_mbps: float | None = None
     speed_samples: list[float] = dataclasses.field(default_factory=list)
     speed_confirmed_slow: bool = False
+    exit_country: str | None = None
 
 
 @dataclasses.dataclass(slots=True)
@@ -257,6 +259,145 @@ def split_csv(value: str) -> list[str]:
 
 def source_id_for(url: str) -> str:
     return hashlib.sha256(url.encode("utf-8")).hexdigest()[:12]
+
+
+# ISO 3166-1 alpha-2 codes. Keeping this local avoids a runtime dependency or
+# an external geolocation API for parsing names supplied by collectors.
+ISO_COUNTRY_CODES = frozenset(
+    "AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW".split()
+)
+
+COUNTRY_NAME_ALIASES = {
+    "afghanistan": "AF", "albania": "AL", "algeria": "DZ", "argentina": "AR",
+    "armenia": "AM", "australia": "AU", "austria": "AT", "azerbaijan": "AZ",
+    "bahrain": "BH", "bangladesh": "BD", "belarus": "BY", "belgium": "BE",
+    "bolivia": "BO", "bosnia": "BA", "brazil": "BR", "bulgaria": "BG",
+    "cambodia": "KH", "cameroon": "CM", "canada": "CA", "chile": "CL",
+    "china": "CN", "colombia": "CO", "costa rica": "CR", "croatia": "HR",
+    "cuba": "CU", "cyprus": "CY", "czech republic": "CZ", "czechia": "CZ",
+    "denmark": "DK", "dominican republic": "DO", "ecuador": "EC", "egypt": "EG",
+    "estonia": "EE", "finland": "FI", "france": "FR", "georgia": "GE",
+    "germany": "DE", "ghana": "GH", "greece": "GR", "hong kong": "HK",
+    "hungary": "HU", "iceland": "IS", "india": "IN", "indonesia": "ID",
+    "iran": "IR", "iraq": "IQ", "ireland": "IE", "israel": "IL", "italy": "IT",
+    "japan": "JP", "jordan": "JO", "kazakhstan": "KZ", "kenya": "KE",
+    "kuwait": "KW", "kyrgyzstan": "KG", "laos": "LA", "latvia": "LV",
+    "lebanon": "LB", "lithuania": "LT", "luxembourg": "LU", "macao": "MO",
+    "macau": "MO", "malaysia": "MY", "maldives": "MV", "malta": "MT",
+    "mexico": "MX", "moldova": "MD", "monaco": "MC", "mongolia": "MN",
+    "montenegro": "ME", "morocco": "MA", "myanmar": "MM", "nepal": "NP",
+    "netherlands": "NL", "new zealand": "NZ", "nigeria": "NG",
+    "north korea": "KP", "north macedonia": "MK", "norway": "NO", "oman": "OM",
+    "pakistan": "PK", "panama": "PA", "paraguay": "PY", "peru": "PE",
+    "philippines": "PH", "poland": "PL", "portugal": "PT", "puerto rico": "PR",
+    "qatar": "QA", "romania": "RO", "russia": "RU", "saudi arabia": "SA",
+    "serbia": "RS", "singapore": "SG", "slovakia": "SK", "slovenia": "SI",
+    "south africa": "ZA", "south korea": "KR", "spain": "ES", "sri lanka": "LK",
+    "sweden": "SE", "switzerland": "CH", "syria": "SY", "taiwan": "TW",
+    "tajikistan": "TJ", "thailand": "TH", "tunisia": "TN", "turkey": "TR",
+    "turkiye": "TR", "turkmenistan": "TM", "ukraine": "UA",
+    "united arab emirates": "AE", "uae": "AE", "united kingdom": "GB",
+    "great britain": "GB", "england": "GB", "united states": "US",
+    "united states of america": "US", "usa": "US", "uruguay": "UY",
+    "uzbekistan": "UZ", "venezuela": "VE", "vietnam": "VN",
+    "andorra": "AD", "angola": "AO", "antigua and barbuda": "AG",
+    "bahamas": "BS", "barbados": "BB", "belize": "BZ", "benin": "BJ",
+    "bhutan": "BT", "botswana": "BW", "brunei": "BN", "burkina faso": "BF",
+    "burundi": "BI", "cape verde": "CV", "cabo verde": "CV",
+    "central african republic": "CF", "chad": "TD", "comoros": "KM",
+    "democratic republic of the congo": "CD", "dr congo": "CD", "drc": "CD",
+    "republic of the congo": "CG", "congo brazzaville": "CG", "congo kinshasa": "CD",
+    "dominica": "DM", "djibouti": "DJ", "el salvador": "SV",
+    "equatorial guinea": "GQ", "eritrea": "ER", "eswatini": "SZ",
+    "swaziland": "SZ", "ethiopia": "ET", "fiji": "FJ", "gabon": "GA",
+    "gambia": "GM", "grenada": "GD", "guatemala": "GT", "guinea": "GN",
+    "guinea bissau": "GW", "guyana": "GY", "haiti": "HT", "honduras": "HN",
+    "ivory coast": "CI", "cote d ivoire": "CI", "cote divoire": "CI", "jamaica": "JM",
+    "kiribati": "KI", "lesotho": "LS", "liberia": "LR", "libya": "LY",
+    "liechtenstein": "LI", "madagascar": "MG", "malawi": "MW", "mali": "ML",
+    "marshall islands": "MH", "mauritania": "MR", "mauritius": "MU",
+    "micronesia": "FM", "federated states of micronesia": "FM",
+    "mozambique": "MZ", "namibia": "NA", "nauru": "NR", "nicaragua": "NI",
+    "niger": "NE", "palau": "PW", "papua new guinea": "PG", "rwanda": "RW",
+    "saint kitts and nevis": "KN", "saint lucia": "LC",
+    "saint vincent and the grenadines": "VC", "samoa": "WS", "san marino": "SM",
+    "sao tome and principe": "ST", "senegal": "SN", "seychelles": "SC",
+    "sierra leone": "SL", "solomon islands": "SB", "somalia": "SO",
+    "south sudan": "SS", "sudan": "SD", "suriname": "SR", "tanzania": "TZ",
+    "timor leste": "TL", "east timor": "TL", "togo": "TG", "tonga": "TO",
+    "trinidad and tobago": "TT", "tuvalu": "TV", "uganda": "UG", "vanuatu": "VU",
+    "vatican city": "VA", "holy see": "VA", "yemen": "YE", "zambia": "ZM",
+    "zimbabwe": "ZW", "kosovo": "XK", "palestine": "PS",
+    # Common collector spellings and local-language names.
+    "holland": "NL", "nederland": "NL", "deutschland": "DE", "osterreich": "AT",
+    "schweiz": "CH", "suisse": "CH", "espana": "ES", "polska": "PL",
+    "cesko": "CZ", "rossiya": "RU", "viet nam": "VN", "korea": "KR",
+    # Frequently seen territories and special regions.
+    "aland islands": "AX", "american samoa": "AS", "anguilla": "AI",
+    "antarctica": "AQ", "aruba": "AW", "bermuda": "BM", "bonaire": "BQ",
+    "british virgin islands": "VG", "cayman islands": "KY", "curacao": "CW",
+    "faroe islands": "FO", "french guiana": "GF", "french polynesia": "PF",
+    "gibraltar": "GI", "greenland": "GL", "guadeloupe": "GP", "guam": "GU",
+    "guernsey": "GG", "isle of man": "IM", "jersey": "JE", "martinique": "MQ",
+    "mayotte": "YT", "new caledonia": "NC", "northern mariana islands": "MP",
+    "reunion": "RE", "saint martin": "MF", "sint maarten": "SX",
+    "turks and caicos islands": "TC", "us virgin islands": "VI",
+}
+
+# XK is widely returned for Kosovo by IP geolocation providers even though it
+# is a user-assigned rather than officially allocated ISO 3166-1 code.
+ISO_COUNTRY_CODES = frozenset((*ISO_COUNTRY_CODES, "XK"))
+
+
+def flag_for_country(code: str) -> str:
+    code = code.upper()
+    if code not in ISO_COUNTRY_CODES:
+        return "🌐"
+    return "".join(chr(0x1F1E6 + ord(char) - ord("A")) for char in code)
+
+
+def country_from_name(name: str) -> str | None:
+    value = html.unescape(urllib.parse.unquote(name or ""))
+    # A flag is the strongest source-name signal and may be followed by noisy
+    # provider/service country codes that refer to something else.
+    for index in range(len(value) - 1):
+        first, second = ord(value[index]), ord(value[index + 1])
+        if 0x1F1E6 <= first <= 0x1F1FF and 0x1F1E6 <= second <= 0x1F1FF:
+            code = chr(first - 0x1F1E6 + ord("A")) + chr(second - 0x1F1E6 + ord("A"))
+            if code in ISO_COUNTRY_CODES:
+                return code
+
+    ascii_value = unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii")
+    normalized = re.sub(r"[^a-z]+", " ", ascii_value.lower()).strip()
+    # Prefer longer aliases so "united states of america" wins over shorter
+    # phrases and country words embedded in collector labels remain usable.
+    for alias in sorted(COUNTRY_NAME_ALIASES, key=len, reverse=True):
+        if re.search(rf"(?:^|\s){re.escape(alias)}(?:$|\s)", normalized):
+            return COUNTRY_NAME_ALIASES[alias]
+
+    for token in re.findall(r"(?<![A-Za-z0-9])([A-Za-z]{2})(?![A-Za-z0-9])", value):
+        code = token.upper()
+        if code == "UK":
+            return "GB"
+        if code in ISO_COUNTRY_CODES:
+            return code
+    return None
+
+
+def set_uri_display_name(uri: str, name: str) -> str:
+    if uri.lower().startswith("vmess://"):
+        encoded = uri[len("vmess://") :].split("#", 1)[0].strip()
+        data = json.loads(b64decode_loose(encoded).decode("utf-8-sig"))
+        if not isinstance(data, dict):
+            raise ValueError("invalid VMess payload")
+        data["ps"] = name
+        payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        return "vmess://" + b64encode_text(payload).rstrip("=")
+
+    parsed = urllib.parse.urlsplit(uri)
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, parsed.path, parsed.query, urllib.parse.quote(name, safe=""))
+    )
 
 
 def extract_source_urls(raw: str) -> list[str]:
@@ -871,6 +1012,33 @@ def probe_once(port: int, url: str, settings: Settings) -> ProbeSample:
     )
 
 
+def detect_exit_country(socks_port: int, timeout: float) -> str | None:
+    """Return the proxy egress ISO country reported by Cloudflare trace."""
+    command = [
+        "curl", "--silent", "--show-error", "--fail", "--http1.1",
+        "--proxy", f"socks5h://127.0.0.1:{socks_port}",
+        "--connect-timeout", str(min(4.0, timeout)), "--max-time", str(timeout),
+        "--user-agent", "MezaVPN-Quality-Scanner/1.0",
+        "https://www.cloudflare.com/cdn-cgi/trace",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout + 2.0,
+            check=False,
+            text=True,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if completed.returncode != 0:
+        return None
+    match = re.search(r"(?m)^loc=([A-Z]{2})\s*$", completed.stdout)
+    code = match.group(1) if match else ""
+    return code if code in ISO_COUNTRY_CODES else None
+
+
 def summarize_samples(samples: list[ProbeSample]) -> tuple[int, float | None, float | None, float]:
     successful = [sample.latency_ms for sample in samples if sample.ok and sample.latency_ms is not None]
     success_count = len(successful)
@@ -952,10 +1120,16 @@ def test_node(node: Node, xray_bin: str, settings: Settings) -> TestResult:
     )
 
 
-def speed_test_node(node: Node, xray_bin: str, settings: Settings) -> tuple[float | None, list[float], bool]:
+def speed_test_node(
+    node: Node, xray_bin: str, settings: Settings
+) -> tuple[float | None, list[float], bool, str | None]:
     samples: list[float] = []
+    exit_country: str | None = None
     try:
         with XraySession(xray_bin, node, settings.xray_start_timeout_seconds) as port:
+            exit_country = detect_exit_country(
+                port, min(6.0, settings.probe_timeout_seconds)
+            )
             url = settings.speed_test_url.format(bytes=settings.speed_test_bytes)
             for _ in range(2):
                 ok, metrics, _ = curl_measure(
@@ -971,13 +1145,44 @@ def speed_test_node(node: Node, xray_bin: str, settings: Settings) -> tuple[floa
                 if samples and samples[-1] >= settings.min_speed_mbps:
                     break
     except Exception:
-        return None, [], False
+        return None, [], False, exit_country
 
     if not samples:
-        return None, [], False
+        return None, [], False, exit_country
     measured = statistics.median(samples)
     confirmed_slow = len(samples) >= 2 and max(samples) < settings.min_speed_mbps
-    return float(measured), samples, confirmed_slow
+    return float(measured), samples, confirmed_slow, exit_country
+
+
+def normalize_published_names(
+    records: list[dict[str, Any]], results: dict[str, TestResult]
+) -> tuple[int, int]:
+    counters: collections.Counter[str] = collections.Counter()
+    detected = 0
+    unknown = 0
+    for record in records:
+        fingerprint = str(record.get("fingerprint", ""))
+        result = results.get(fingerprint)
+        code = result.exit_country if result is not None else None
+        if not code:
+            code = country_from_name(str(record.get("name", "")))
+        if code not in ISO_COUNTRY_CODES:
+            code = "UN"
+            unknown += 1
+        else:
+            detected += 1
+        counters[code] += 1
+        display_name = f"{flag_for_country(code)} {code} | Server {counters[code]}"
+        try:
+            record["uri"] = set_uri_display_name(str(record["uri"]), display_name)
+        except Exception:
+            # A URI was already parsed successfully, but retaining the original
+            # is safer than dropping a healthy node if display-name rewriting
+            # ever encounters a collector-specific edge case.
+            pass
+        record["name"] = display_name
+        record["country"] = code
+    return detected, unknown
 
 
 def record_score(record: dict[str, Any], settings: Settings) -> float:
@@ -1211,10 +1416,11 @@ def run(args: argparse.Namespace) -> int:
             }
             for future in concurrent.futures.as_completed(future_map):
                 result = future_map[future]
-                speed, samples, confirmed_slow = future.result()
+                speed, samples, confirmed_slow, exit_country = future.result()
                 result.speed_mbps = speed
                 result.speed_samples = samples
                 result.speed_confirmed_slow = confirmed_slow
+                result.exit_country = exit_country
                 if confirmed_slow:
                     result.passed = False
                     result.reason = "confirmed_slow"
@@ -1323,6 +1529,7 @@ def run(args: argparse.Namespace) -> int:
         safety_mode = "accepted_after_repeated_degradation"
         suspicious_streak = 0
 
+    country_detected, country_unknown = normalize_published_names(selected, results)
     elite_count = sum(
         1 for record in selected if float(record.get("latency_ms") or 99_999) <= settings.elite_latency_ms
     )
@@ -1387,6 +1594,11 @@ def run(args: argparse.Namespace) -> int:
             "tested": len(speed_candidates),
             "sample_bytes": settings.speed_test_bytes,
             "confirmed_slow_removed": sum(1 for result in speed_candidates if result.speed_confirmed_slow),
+        },
+        "naming": {
+            "format": "FLAG CC | Server N",
+            "country_detected": country_detected,
+            "country_unknown": country_unknown,
         },
         "safety_mode": safety_mode,
         "duration_seconds": round(time.monotonic() - started, 2),

@@ -116,6 +116,78 @@ class ScannerParserTests(unittest.TestCase):
         self.assertEqual(stream["tlsSettings"]["serverName"], "cdn.example.com")
         self.assertEqual(stream["wsSettings"]["host"], "cdn.example.com")
 
+    def test_country_detection_from_flag_code_and_full_name(self):
+        self.assertEqual(scanner.country_from_name("🇩🇪 | @WhiteDNS | DE33|GPT-US"), "DE")
+        self.assertEqual(scanner.country_from_name("undefined HK | server"), "HK")
+        self.assertEqual(scanner.country_from_name("Sertraline-Finland-c20"), "FI")
+        self.assertEqual(scanner.country_from_name("Premium-Türkiye-01"), "TR")
+        self.assertEqual(scanner.country_from_name("Servidor-España-02"), "ES")
+        self.assertEqual(scanner.country_from_name("Côte d’Ivoire node"), "CI")
+        self.assertEqual(scanner.country_from_name("Papua-New-Guinea-fast"), "PG")
+        self.assertIsNone(scanner.country_from_name("Fast Private Server"))
+
+    def test_all_country_aliases_map_to_supported_codes(self):
+        self.assertTrue(scanner.COUNTRY_NAME_ALIASES)
+        self.assertFalse(
+            set(scanner.COUNTRY_NAME_ALIASES.values()) - scanner.ISO_COUNTRY_CODES
+        )
+
+    def test_exit_country_reads_cloudflare_trace(self):
+        completed = mock.Mock(returncode=0, stdout="fl=1\nip=203.0.113.1\nloc=JP\ntls=TLSv1.3\n")
+        with mock.patch.object(scanner.subprocess, "run", return_value=completed):
+            self.assertEqual(scanner.detect_exit_country(19080, 5.0), "JP")
+
+    def test_display_name_rewrite_preserves_vless_fingerprint(self):
+        uri = f"vless://{UUID}@example.com:443?security=tls&type=tcp#Old"
+        before = scanner.parse_node(uri)
+        rewritten = scanner.set_uri_display_name(uri, "🇺🇸 US | Server 1")
+        after = scanner.parse_node(rewritten)
+        self.assertEqual(after.name, "🇺🇸 US | Server 1")
+        self.assertEqual(after.fingerprint, before.fingerprint)
+
+    def test_display_name_rewrite_preserves_vmess_fingerprint(self):
+        payload = {
+            "v": "2", "ps": "Old", "add": "example.com", "port": "443",
+            "id": UUID, "aid": "0", "net": "ws", "path": "/", "tls": "tls",
+        }
+        uri = "vmess://" + base64.b64encode(json.dumps(payload).encode()).decode()
+        before = scanner.parse_node(uri)
+        rewritten = scanner.set_uri_display_name(uri, "🇨🇦 CA | Server 1")
+        after = scanner.parse_node(rewritten)
+        self.assertEqual(after.name, "🇨🇦 CA | Server 1")
+        self.assertEqual(after.fingerprint, before.fingerprint)
+
+    def test_display_name_rewrite_supports_trojan_and_shadowsocks(self):
+        ss_user = base64.urlsafe_b64encode(b"aes-256-gcm:password").decode().rstrip("=")
+        uris = [
+            "trojan://secret@example.com:443?security=tls#Old",
+            f"ss://{ss_user}@example.com:8388#Old",
+        ]
+        for uri in uris:
+            with self.subTest(uri=uri):
+                before = scanner.parse_node(uri)
+                rewritten = scanner.set_uri_display_name(uri, "🇳🇱 NL | Server 1")
+                after = scanner.parse_node(rewritten)
+                self.assertEqual(after.name, "🇳🇱 NL | Server 1")
+                self.assertEqual(after.fingerprint, before.fingerprint)
+
+    def test_published_names_are_numbered_per_country(self):
+        records = [
+            {"fingerprint": "a", "name": "🇺🇸 source", "uri": f"vless://{UUID}@a.example:443#x"},
+            {"fingerprint": "b", "name": "United States node", "uri": f"vless://{UUID}@b.example:443#x"},
+            {"fingerprint": "c", "name": "Canada", "uri": f"vless://{UUID}@c.example:443#x"},
+            {"fingerprint": "d", "name": "mystery", "uri": f"vless://{UUID}@d.example:443#x"},
+        ]
+        detected, unknown = scanner.normalize_published_names(records, {})
+        self.assertEqual((detected, unknown), (3, 1))
+        self.assertEqual(
+            [record["name"] for record in records],
+            [
+                "🇺🇸 US | Server 1", "🇺🇸 US | Server 2",
+                "🇨🇦 CA | Server 1", "🌐 UN | Server 1",
+            ],
+        )
+
     def test_settings_defaults(self):
         settings = scanner.Settings.from_env()
         self.assertEqual(settings.max_latency_ms, 3000.0)

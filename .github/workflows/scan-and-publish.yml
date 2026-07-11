@@ -1,0 +1,114 @@
+name: Scan and publish MezaVPN subscription
+
+on:
+  schedule:
+    # GitHub cron uses UTC. Minutes 7 and 37 avoid the busiest minute of each hour.
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: meza-vip-scanner-pages
+  cancel-in-progress: true
+
+env:
+  XRAY_VERSION: "v26.3.27"
+  ELITE_LATENCY_MS: "500"
+  MAX_LATENCY_MS: "1000"
+  MAX_OUTPUT: "100"
+  MAX_CONFIGS: "1800"
+  SCAN_WORKERS: "20"
+  SPEED_WORKERS: "6"
+  SPEED_TEST_MAX: "40"
+  SPEED_TEST_BYTES: "262144"
+  MIN_SPEED_MBPS: "0.25"
+  GRACE_SCANS: "1"
+  GRACE_MAX_AGE_MINUTES: "120"
+  MAX_SCAN_SECONDS: "1320"
+  OUTPUT_FORMAT: "base64"
+
+jobs:
+  scan:
+    name: Validate, rank and build subscription
+    runs-on: ubuntu-latest
+    timeout-minutes: 27
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Run parser tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Download and verify Xray-core
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tools/xray
+          base="https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}"
+          curl --fail --location --retry 3 --retry-delay 2 \
+            --output /tmp/xray.zip "${base}/Xray-linux-64.zip"
+          curl --fail --location --retry 3 --retry-delay 2 \
+            --output /tmp/xray.zip.dgst "${base}/Xray-linux-64.zip.dgst"
+
+          expected="$(awk -F '= ' '/256=/ {print $2; exit}' /tmp/xray.zip.dgst | tr -d '\r[:space:]')"
+          actual="$(sha256sum /tmp/xray.zip | awk '{print $1}')"
+          if [[ -z "${expected}" || "${expected,,}" != "${actual,,}" ]]; then
+            echo "Xray checksum verification failed."
+            exit 1
+          fi
+
+          unzip -q /tmp/xray.zip -d .tools/xray
+          chmod +x .tools/xray/xray
+          .tools/xray/xray version
+
+      - name: Validate generated configs with Xray
+        run: python tests/validate_xray_configs.py .tools/xray/xray
+
+      - name: Build public subscription files
+        env:
+          SUB_URLS: ${{ secrets.SUB_URLS }}
+          PREVIOUS_STATE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/state.json
+        run: |
+          set -euo pipefail
+          rm -rf public
+          python scanner.py \
+            --xray .tools/xray/xray \
+            --output-dir public \
+            --previous-state-url "$PREVIOUS_STATE_URL"
+          cat public/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: public
+
+  deploy:
+    name: Deploy stable subscription URL
+    needs: scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

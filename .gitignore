@@ -1,0 +1,4 @@
+.tools/
+public/
+__pycache__/
+*.pyc

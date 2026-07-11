@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
 import concurrent.futures
 import dataclasses
 import datetime as dt
@@ -52,9 +53,10 @@ class UnsupportedNode(ScannerError):
 
 @dataclasses.dataclass(slots=True)
 class Settings:
-    elite_latency_ms: float = 500.0
-    max_latency_ms: float = 1000.0
-    max_output: int = 100
+    elite_latency_ms: float = 800.0
+    max_latency_ms: float = 3000.0
+    max_jitter_ms: float = 600.0
+    max_output: int = 450
     max_configs: int = 1800
     scan_workers: int = 20
     speed_workers: int = 6
@@ -63,9 +65,9 @@ class Settings:
     probe_timeout_seconds: float = 7.0
     xray_start_timeout_seconds: float = 4.0
     source_timeout_seconds: float = 25.0
-    speed_test_max: int = 40
+    speed_test_max: int = 450
     speed_test_bytes: int = 262_144
-    min_speed_mbps: float = 0.25
+    min_speed_mbps: float = 0.5
     grace_scans: int = 1
     grace_max_age_minutes: int = 120
     catastrophic_ratio: float = 0.15
@@ -101,6 +103,7 @@ class Settings:
         settings = cls(
             elite_latency_ms=env_float("ELITE_LATENCY_MS", defaults.elite_latency_ms),
             max_latency_ms=env_float("MAX_LATENCY_MS", defaults.max_latency_ms),
+            max_jitter_ms=env_float("MAX_JITTER_MS", defaults.max_jitter_ms),
             max_output=env_int("MAX_OUTPUT", defaults.max_output),
             max_configs=env_int("MAX_CONFIGS", defaults.max_configs),
             scan_workers=env_int("SCAN_WORKERS", defaults.scan_workers),
@@ -137,6 +140,8 @@ class Settings:
     def validate(self) -> None:
         if not 0 < self.elite_latency_ms <= self.max_latency_ms:
             raise ScannerError("ELITE_LATENCY_MS must be > 0 and <= MAX_LATENCY_MS")
+        if self.max_jitter_ms <= 0:
+            raise ScannerError("MAX_JITTER_MS must be positive")
         if self.max_output < 1 or self.max_configs < 1:
             raise ScannerError("MAX_OUTPUT and MAX_CONFIGS must be positive")
         if not 1 <= self.scan_workers <= 50:
@@ -323,6 +328,11 @@ def extract_links(text: str) -> list[str]:
         value = line.strip().strip("\ufeff")
         if not value or value.startswith("#"):
             continue
+        # Some collectors embed share links in HTML/XML-derived text and leave
+        # query separators escaped (``&amp;``).  Without unescaping first, every
+        # parameter after the first one becomes part of the previous value and
+        # Xray is built with the wrong transport/TLS settings.
+        value = html.unescape(value)
         if "%3A%2F%2F" in value.upper():
             value = urllib.parse.unquote(value)
         lower = value.lower()
@@ -891,7 +901,7 @@ def test_node(node: Node, xray_bin: str, settings: Settings) -> TestResult:
                 success_count < settings.primary_attempts
                 or median is None
                 or median > settings.elite_latency_ms
-                or (jitter is not None and jitter > 350)
+                or (jitter is not None and jitter > settings.max_jitter_ms * 0.6)
             )
             if needs_retest:
                 for index in range(settings.retest_attempts):
@@ -911,21 +921,25 @@ def test_node(node: Node, xray_bin: str, settings: Settings) -> TestResult:
             None,
             None,
             0.0,
-            type(exc).__name__,
+            "confirmed_unreachable",
         )
 
     success_count, median, jitter, success_rate = summarize_samples(samples)
     failures = len(samples) - success_count
     minimum_successes = settings.primary_attempts
-    stable_enough = (
-        success_count >= minimum_successes
-        and failures <= 1
-        and success_rate >= 0.75
-        and median is not None
-        and median <= settings.max_latency_ms
-        and (jitter is None or jitter <= max(450.0, settings.max_latency_ms * 0.65))
-    )
-    reason = "ok" if stable_enough else "latency/stability threshold not met"
+    if success_count == 0:
+        reason = "confirmed_unreachable"
+    elif success_count < minimum_successes:
+        reason = "insufficient_successes"
+    elif failures > 1 or success_rate < 0.75:
+        reason = "unstable"
+    elif median is None or median > settings.max_latency_ms:
+        reason = "consistently_high_latency"
+    elif jitter is not None and jitter > settings.max_jitter_ms:
+        reason = "unstable_jitter"
+    else:
+        reason = "ok"
+    stable_enough = reason == "ok"
     return TestResult(
         node.fingerprint,
         stable_enough,
@@ -1072,6 +1086,7 @@ a{{display:inline-block;margin-right:14px}}
         f"- Unique supported configs: `{status['configs']['unique_supported']}`",
         f"- Passed current tests: `{status['configs']['passed_current']}`",
         f"- Published: `{status['configs']['published']}`",
+        f"- Broken/rejected: `{status['broken']['total']}`",
         f"- Elite (≤ {settings.elite_latency_ms:.0f} ms): `{status['quality']['elite']}`",
         f"- Acceptable (≤ {settings.max_latency_ms:.0f} ms): `{status['quality']['acceptable']}`",
         f"- Safety mode: `{status['safety_mode']}`",
@@ -1202,7 +1217,7 @@ def run(args: argparse.Namespace) -> int:
                 result.speed_confirmed_slow = confirmed_slow
                 if confirmed_slow:
                     result.passed = False
-                    result.reason = "confirmed very low throughput"
+                    result.reason = "confirmed_slow"
 
     now = iso_now()
     current_records: dict[str, dict[str, Any]] = {}
@@ -1221,6 +1236,11 @@ def run(args: argparse.Namespace) -> int:
         if (
             isinstance(previous, dict)
             and (result is None or result.success_count >= 1)
+            and (
+                result is None
+                or result.reason
+                not in {"confirmed_unreachable", "consistently_high_latency", "confirmed_slow"}
+            )
             and int(previous.get("failure_streak", 0) or 0) < settings.grace_scans
             and previous_record_is_fresh(previous, settings)
         ):
@@ -1267,11 +1287,22 @@ def run(args: argparse.Namespace) -> int:
     )
     selected = eligible[: settings.max_output]
 
-    previous_selected_records = [
-        dict(previous_nodes[fp], fingerprint=fp)
-        for fp in previous_selected
-        if fp in previous_nodes and isinstance(previous_nodes[fp], dict)
-    ]
+    previous_selected_records = []
+    for fingerprint in previous_selected:
+        previous = previous_nodes.get(fingerprint)
+        if not isinstance(previous, dict):
+            continue
+        # Catastrophic-output protection must never resurrect a node that this
+        # run conclusively found unreachable, extremely slow, or far beyond
+        # the broad viability latency ceiling. Nodes that were not testable
+        # because a source/run failed may still be preserved once.
+        result = results.get(fingerprint)
+        if result is not None and (
+            result.success_count == 0
+            or result.reason in {"consistently_high_latency", "confirmed_slow"}
+        ):
+            continue
+        previous_selected_records.append(dict(previous, fingerprint=fingerprint))
     suspicious = False
     if previous_selected_records:
         threshold = max(3, math.ceil(len(previous_selected_records) * settings.catastrophic_ratio))
@@ -1296,6 +1327,11 @@ def run(args: argparse.Namespace) -> int:
         1 for record in selected if float(record.get("latency_ms") or 99_999) <= settings.elite_latency_ms
     )
     acceptable_count = len(selected) - elite_count
+    rejection_reasons = collections.Counter(
+        result.reason for result in results.values() if not result.passed
+    )
+    tested_rejected = sum(rejection_reasons.values())
+    broken_total = unsupported + invalid + tested_rejected
     status = {
         "generated_at": now,
         "scanner_version": SCANNER_VERSION,
@@ -1315,12 +1351,37 @@ def run(args: argparse.Namespace) -> int:
             "passed_current": passed_current,
             "grace_retained": grace_count,
             "published": len(selected),
+            "broken_or_rejected": broken_total,
+        },
+        "broken": {
+            "total": broken_total,
+            "unparseable_supported_links": unsupported + invalid,
+            "confirmed_unreachable": rejection_reasons["confirmed_unreachable"],
+            "insufficient_successes": rejection_reasons["insufficient_successes"],
+            "unstable": rejection_reasons["unstable"]
+            + rejection_reasons["unstable_jitter"],
+            "consistently_high_latency": rejection_reasons["consistently_high_latency"],
+            "confirmed_slow": rejection_reasons["confirmed_slow"],
+            "other_test_failures": tested_rejected
+            - sum(
+                rejection_reasons[key]
+                for key in (
+                    "confirmed_unreachable",
+                    "insufficient_successes",
+                    "unstable",
+                    "unstable_jitter",
+                    "consistently_high_latency",
+                    "confirmed_slow",
+                )
+            ),
+            "note": "Duplicates are not counted as broken; unsupported external protocols are not extracted by this scanner.",
         },
         "quality": {
             "elite": elite_count,
             "acceptable": acceptable_count,
             "elite_threshold_ms": settings.elite_latency_ms,
             "maximum_threshold_ms": settings.max_latency_ms,
+            "maximum_jitter_ms": settings.max_jitter_ms,
         },
         "speed_test": {
             "tested": len(speed_candidates),

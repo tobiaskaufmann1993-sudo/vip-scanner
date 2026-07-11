@@ -1,6 +1,7 @@
 import base64
 import json
 import unittest
+from unittest import mock
 
 import scanner
 
@@ -9,6 +10,19 @@ UUID = "11111111-1111-4111-8111-111111111111"
 
 
 class ScannerParserTests(unittest.TestCase):
+    def _test_result_for_samples(self, samples):
+        settings = scanner.Settings()
+        node = scanner.parse_node(
+            f"vless://{UUID}@example.com:443?security=tls&type=tcp#health"
+        )
+        session = mock.MagicMock()
+        session.__enter__.return_value = 19080
+        session.__exit__.return_value = None
+        with mock.patch.object(scanner, "XraySession", return_value=session), mock.patch.object(
+            scanner, "probe_once", side_effect=samples
+        ):
+            return scanner.test_node(node, "xray", settings)
+
     def test_vless_ws_tls(self):
         uri = (
             f"vless://{UUID}@example.com:443?encryption=none&security=tls"
@@ -88,10 +102,26 @@ class ScannerParserTests(unittest.TestCase):
         links = scanner.extract_links(decoded)
         self.assertEqual(len(links), 2)
 
+    def test_html_escaped_query_separators_are_restored(self):
+        raw = (
+            f"vless://{UUID}@example.com:443?security=tls&amp;sni=cdn.example.com"
+            "&amp;type=ws&amp;host=cdn.example.com&amp;path=%2Fws#HTML"
+        )
+        links = scanner.extract_links(raw)
+        self.assertEqual(len(links), 1)
+        self.assertNotIn("&amp;", links[0])
+        node = scanner.parse_node(links[0])
+        stream = node.outbound["streamSettings"]
+        self.assertEqual(stream["network"], "websocket")
+        self.assertEqual(stream["tlsSettings"]["serverName"], "cdn.example.com")
+        self.assertEqual(stream["wsSettings"]["host"], "cdn.example.com")
+
     def test_settings_defaults(self):
         settings = scanner.Settings.from_env()
-        self.assertEqual(settings.max_latency_ms, 1000.0)
-        self.assertEqual(settings.elite_latency_ms, 500.0)
+        self.assertEqual(settings.max_latency_ms, 3000.0)
+        self.assertEqual(settings.elite_latency_ms, 800.0)
+        self.assertEqual(settings.max_jitter_ms, 600.0)
+        self.assertEqual(settings.max_output, 450)
 
     def test_latency_dominates_speed_in_ranking(self):
         settings = scanner.Settings.from_env()
@@ -124,6 +154,34 @@ class ScannerParserTests(unittest.TestCase):
         self.assertEqual(median, 220.0)
         self.assertEqual(jitter, 30.0)
         self.assertEqual(success_rate, 1.0)
+
+    def test_health_filter_marks_zero_responses_unreachable(self):
+        result = self._test_result_for_samples(
+            [scanner.ProbeSample(False, reason="timeout") for _ in range(5)]
+        )
+        self.assertFalse(result.passed)
+        self.assertEqual(result.reason, "confirmed_unreachable")
+
+    def test_health_filter_keeps_stable_viable_node(self):
+        result = self._test_result_for_samples(
+            [scanner.ProbeSample(True, latency_ms=value) for value in (900, 950, 1000, 920, 980)]
+        )
+        self.assertTrue(result.passed)
+        self.assertEqual(result.reason, "ok")
+
+    def test_health_filter_rejects_consistently_extreme_latency(self):
+        result = self._test_result_for_samples(
+            [scanner.ProbeSample(True, latency_ms=value) for value in (3200, 3300, 3400, 3250, 3350)]
+        )
+        self.assertFalse(result.passed)
+        self.assertEqual(result.reason, "consistently_high_latency")
+
+    def test_health_filter_rejects_repeated_large_jitter(self):
+        result = self._test_result_for_samples(
+            [scanner.ProbeSample(True, latency_ms=value) for value in (100, 900, 1000, 1100, 1200)]
+        )
+        self.assertFalse(result.passed)
+        self.assertEqual(result.reason, "unstable_jitter")
 
 
 if __name__ == "__main__":

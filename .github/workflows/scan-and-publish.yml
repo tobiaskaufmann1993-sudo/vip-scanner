@@ -12,29 +12,33 @@ permissions:
 
 concurrency:
   group: meza-vip-scanner-pages
-  cancel-in-progress: true
+  # Never cancel a scan before it can publish. If a 30-minute schedule fires
+  # while the previous run is still active, GitHub keeps the next run pending.
+  cancel-in-progress: false
 
 env:
   XRAY_VERSION: "v26.3.27"
-  ELITE_LATENCY_MS: "500"
-  MAX_LATENCY_MS: "1000"
-  MAX_OUTPUT: "100"
+  # Broad health filter only; the client performs final regional selection.
+  ELITE_LATENCY_MS: "800"
+  MAX_LATENCY_MS: "3000"
+  MAX_JITTER_MS: "600"
+  MAX_OUTPUT: "450"
   MAX_CONFIGS: "1800"
   SCAN_WORKERS: "20"
-  SPEED_WORKERS: "6"
-  SPEED_TEST_MAX: "40"
+  SPEED_WORKERS: "12"
+  SPEED_TEST_MAX: "450"
   SPEED_TEST_BYTES: "262144"
-  MIN_SPEED_MBPS: "0.25"
+  MIN_SPEED_MBPS: "0.5"
   GRACE_SCANS: "1"
   GRACE_MAX_AGE_MINUTES: "120"
-  MAX_SCAN_SECONDS: "1320"
+  MAX_SCAN_SECONDS: "2220"
   OUTPUT_FORMAT: "base64"
 
 jobs:
   scan:
     name: Validate, rank and build subscription
     runs-on: ubuntu-latest
-    timeout-minutes: 27
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository

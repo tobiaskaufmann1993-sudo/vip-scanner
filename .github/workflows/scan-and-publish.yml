@@ -1,9 +1,8 @@
 name: Scan and publish MezaVPN subscription
 
 on:
-  schedule:
-    # GitHub cron uses UTC. Minutes 7 and 37 avoid the busiest minute of each hour.
-    - cron: "7,37 * * * *"
+  # Triggered manually or by an external 30-minute scheduler through GitHub's
+  # workflow-dispatch API. No polling or extra freshness jobs are created.
   workflow_dispatch:
 permissions:
   contents: read
@@ -12,8 +11,6 @@ permissions:
 
 concurrency:
   group: meza-vip-scanner-pages
-  # Never cancel a scan before it can publish. If a 30-minute schedule fires
-  # while the previous run is still active, GitHub keeps the next run pending.
   cancel-in-progress: false
 
 env:

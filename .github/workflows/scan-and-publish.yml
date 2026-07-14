@@ -1,8 +1,10 @@
 name: Scan and publish MezaVPN subscription
 
 on:
-  # Triggered manually or by an external 30-minute scheduler through GitHub's
-  # workflow-dispatch API. No polling or extra freshness jobs are created.
+  schedule:
+    # Four opportunities per hour compensate for GitHub occasionally delaying
+    # a scheduled event. The gate below permits a full scan only every ~30 min.
+    - cron: "8,23,38,53 * * * *"
   workflow_dispatch:
 permissions:
   contents: read
@@ -32,8 +34,58 @@ env:
   OUTPUT_FORMAT: "base64"
 
 jobs:
+  freshness:
+    name: Check whether a scan is due
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Check published result age
+        id: check
+        shell: bash
+        env:
+          STATUS_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/status.json
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" != "schedule" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "Manual run requested: starting a full scan."
+            exit 0
+          fi
+
+          status_file="$(mktemp)"
+          if ! curl --fail --silent --show-error --location \
+            --retry 2 --max-time 12 -H 'Cache-Control: no-cache' \
+            -o "$status_file" "${STATUS_URL}?check=${GITHUB_RUN_ID}"; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "Previous status is unavailable: starting a full scan."
+            exit 0
+          fi
+
+          age_seconds="$(python -c '
+          import datetime as dt, json, sys
+          try:
+              data = json.load(open(sys.argv[1], encoding="utf-8"))
+              stamp = dt.datetime.fromisoformat(data["generated_at"].replace("Z", "+00:00"))
+              print(max(0, int((dt.datetime.now(dt.timezone.utc) - stamp).total_seconds())))
+          except Exception:
+              print(999999)
+          ' "$status_file")"
+
+          if (( age_seconds >= 1500 )); then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "Published result is ${age_seconds}s old: starting a full scan."
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "Published result is ${age_seconds}s old: no scan needed yet."
+          fi
+
   scan:
     name: Validate, rank and build subscription
+    needs: freshness
+    if: needs.freshness.outputs.should_run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 

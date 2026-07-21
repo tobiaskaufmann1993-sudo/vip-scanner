@@ -139,6 +139,112 @@ jobs:
             --previous-state-url "$PREVIOUS_STATE_URL"
           cat public/summary.md >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Publish subscription mirror to ArvanCloud
+        id: arvan_upload
+        continue-on-error: true
+        shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.ARVAN_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.ARVAN_SECRET_KEY }}
+          AWS_EC2_METADATA_DISABLED: "true"
+          AWS_PAGER: ""
+          ARVAN_BUCKET: ${{ secrets.ARVAN_BUCKET }}
+          ARVAN_ENDPOINT: ${{ secrets.ARVAN_ENDPOINT }}
+          ARVAN_REGION: ${{ secrets.ARVAN_REGION }}
+          ARVAN_PUBLIC_BASE_URL: ${{ secrets.ARVAN_PUBLIC_BASE_URL }}
+        run: |
+          set -euo pipefail
+
+          required=(
+            AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY ARVAN_BUCKET
+            ARVAN_ENDPOINT ARVAN_REGION
+          )
+          missing=()
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "ArvanCloud mirror is not configured; missing: ${missing[*]}"
+            echo "- ArvanCloud mirror: not configured" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [[ ! "$ARVAN_ENDPOINT" =~ ^https://[A-Za-z0-9.-]+/?$ ]]; then
+            echo "ARVAN_ENDPOINT must be an HTTPS S3 endpoint." >&2
+            exit 1
+          fi
+          if [[ ! "$ARVAN_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]]; then
+            echo "ARVAN_BUCKET has an invalid S3 bucket name." >&2
+            exit 1
+          fi
+          if [[ ! "$ARVAN_REGION" =~ ^[A-Za-z0-9-]+$ ]]; then
+            echo "ARVAN_REGION is invalid." >&2
+            exit 1
+          fi
+
+          if ! command -v aws >/dev/null 2>&1; then
+            python -m pip install --disable-pip-version-check --quiet awscli
+          fi
+
+          aws_args=(
+            --endpoint-url "${ARVAN_ENDPOINT%/}"
+            --region "$ARVAN_REGION"
+          )
+          upload_args=(
+            --acl public-read
+            --cache-control "no-cache, no-store, must-revalidate"
+            --only-show-errors
+            --no-progress
+          )
+
+          # Upload auxiliary files first. sub.txt is uploaded last so the app's
+          # primary URL switches only after the matching diagnostics exist.
+          aws "${aws_args[@]}" s3 cp public/sub-raw.txt \
+            "s3://${ARVAN_BUCKET}/sub-raw.txt" \
+            --content-type "text/plain; charset=utf-8" "${upload_args[@]}"
+          aws "${aws_args[@]}" s3 cp public/sub-base64.txt \
+            "s3://${ARVAN_BUCKET}/sub-base64.txt" \
+            --content-type "text/plain; charset=us-ascii" "${upload_args[@]}"
+          aws "${aws_args[@]}" s3 cp public/status.json \
+            "s3://${ARVAN_BUCKET}/status.json" \
+            --content-type "application/json; charset=utf-8" "${upload_args[@]}"
+          aws "${aws_args[@]}" s3 cp public/sub.txt \
+            "s3://${ARVAN_BUCKET}/sub.txt" \
+            --content-type "text/plain; charset=us-ascii" "${upload_args[@]}"
+
+          # Authenticated verification proves that the final object exists and
+          # has exactly the same byte length as the freshly generated file.
+          remote_size="$(aws "${aws_args[@]}" s3api head-object \
+            --bucket "$ARVAN_BUCKET" --key sub.txt \
+            --query ContentLength --output text)"
+          local_size="$(wc -c < public/sub.txt | tr -d '[:space:]')"
+          if [[ "$remote_size" != "$local_size" ]]; then
+            echo "ArvanCloud verification failed: local=${local_size}, remote=${remote_size}" >&2
+            exit 1
+          fi
+
+          if [[ -n "$ARVAN_PUBLIC_BASE_URL" ]]; then
+            public_url="${ARVAN_PUBLIC_BASE_URL%/}/sub.txt"
+            curl --fail --silent --show-error --location \
+              --retry 3 --max-time 20 \
+              -H 'Cache-Control: no-cache' \
+              -o /tmp/arvan-sub.txt "${public_url}?verify=${GITHUB_RUN_ID}"
+            cmp --silent public/sub.txt /tmp/arvan-sub.txt
+            echo "- ArvanCloud mirror: uploaded and publicly verified" >> "$GITHUB_STEP_SUMMARY"
+            echo "- ArvanCloud URL: ${public_url}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- ArvanCloud mirror: uploaded and authenticated verification passed" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Report ArvanCloud mirror failure
+        if: steps.arvan_upload.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "::warning::ArvanCloud mirror upload failed; GitHub Pages publishing will continue."
+          echo "- ArvanCloud mirror: upload failed (GitHub Pages continued)" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v6
 

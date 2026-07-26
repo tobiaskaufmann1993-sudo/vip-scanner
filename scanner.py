@@ -3,8 +3,9 @@
 
 The scanner downloads one or more standard V2Ray subscription feeds, removes
 functional duplicates, validates supported nodes with Xray-core, measures real
-end-to-end HTTPS response latency through each proxy, performs a small download
-speed test on the best candidates, and publishes a stable subscription set.
+end-to-end HTTPS response latency through each proxy, performs budgeted
+streaming-quality tests, tracks recent reliability, and publishes a stable
+subscription set.
 
 Supported share links: vless://, vmess://, trojan:// and SIP002 ss:// links
 without external plugins.
@@ -40,8 +41,21 @@ from pathlib import Path
 from typing import Any, Iterable
 
 SUPPORTED_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://")
-SCANNER_VERSION = "1.1.0"
+SCANNER_VERSION = "1.2.0"
 UTC = dt.timezone.utc
+HARD_REJECTION_REASONS = frozenset(
+    {
+        "confirmed_unreachable",
+        "insufficient_successes",
+        "unstable",
+        "unstable_jitter",
+        "consistently_high_latency",
+        "confirmed_slow",
+        "stream_stall",
+        "stream_below_target",
+        "stream_unverified",
+    }
+)
 
 
 class ScannerError(RuntimeError):
@@ -68,7 +82,13 @@ class Settings:
     source_timeout_seconds: float = 25.0
     speed_test_max: int = 450
     speed_test_bytes: int = 262_144
-    min_speed_mbps: float = 0.5
+    stream_test_bytes: int = 1_048_576
+    speed_budget_bytes: int = 100_663_296
+    min_speed_mbps: float = 1.1
+    good_speed_mbps: float = 1.5
+    strong_speed_mbps: float = 2.5
+    stream_low_speed_seconds: int = 3
+    stream_history_scans: int = 6
     grace_scans: int = 1
     grace_max_age_minutes: int = 120
     catastrophic_ratio: float = 0.15
@@ -122,7 +142,19 @@ class Settings:
             ),
             speed_test_max=env_int("SPEED_TEST_MAX", defaults.speed_test_max),
             speed_test_bytes=env_int("SPEED_TEST_BYTES", defaults.speed_test_bytes),
+            stream_test_bytes=env_int("STREAM_TEST_BYTES", defaults.stream_test_bytes),
+            speed_budget_bytes=env_int("SPEED_BUDGET_BYTES", defaults.speed_budget_bytes),
             min_speed_mbps=env_float("MIN_SPEED_MBPS", defaults.min_speed_mbps),
+            good_speed_mbps=env_float("GOOD_SPEED_MBPS", defaults.good_speed_mbps),
+            strong_speed_mbps=env_float(
+                "STRONG_SPEED_MBPS", defaults.strong_speed_mbps
+            ),
+            stream_low_speed_seconds=env_int(
+                "STREAM_LOW_SPEED_SECONDS", defaults.stream_low_speed_seconds
+            ),
+            stream_history_scans=env_int(
+                "STREAM_HISTORY_SCANS", defaults.stream_history_scans
+            ),
             grace_scans=env_int("GRACE_SCANS", defaults.grace_scans),
             grace_max_age_minutes=env_int(
                 "GRACE_MAX_AGE_MINUTES", defaults.grace_max_age_minutes
@@ -145,6 +177,8 @@ class Settings:
             raise ScannerError("MAX_JITTER_MS must be positive")
         if self.max_output < 1 or self.max_configs < 1:
             raise ScannerError("MAX_OUTPUT and MAX_CONFIGS must be positive")
+        if self.speed_test_max < 1:
+            raise ScannerError("SPEED_TEST_MAX must be positive")
         if not 1 <= self.scan_workers <= 50:
             raise ScannerError("SCAN_WORKERS must be between 1 and 50")
         if not 1 <= self.speed_workers <= 20:
@@ -155,6 +189,27 @@ class Settings:
             raise ScannerError("OUTPUT_FORMAT must be base64 or raw")
         if not self.probe_urls:
             raise ScannerError("At least one PROBE_URL is required")
+        if "{bytes}" not in self.speed_test_url:
+            raise ScannerError("SPEED_TEST_URL must contain the {bytes} placeholder")
+        speed_url = urllib.parse.urlsplit(
+            self.speed_test_url.format(bytes=self.speed_test_bytes)
+        )
+        if speed_url.scheme != "https" or not speed_url.netloc:
+            raise ScannerError("SPEED_TEST_URL must be a valid HTTPS URL")
+        if self.speed_test_bytes < 65_536 or self.stream_test_bytes < self.speed_test_bytes:
+            raise ScannerError(
+                "SPEED_TEST_BYTES must be >= 65536 and STREAM_TEST_BYTES must be at least as large"
+            )
+        if self.speed_budget_bytes < self.speed_test_bytes:
+            raise ScannerError("SPEED_BUDGET_BYTES is too small for one quick test")
+        if not 0 < self.min_speed_mbps <= self.good_speed_mbps <= self.strong_speed_mbps:
+            raise ScannerError(
+                "Speed thresholds must satisfy 0 < MIN_SPEED_MBPS <= GOOD_SPEED_MBPS <= STRONG_SPEED_MBPS"
+            )
+        if not 2 <= self.stream_low_speed_seconds <= 10:
+            raise ScannerError("STREAM_LOW_SPEED_SECONDS must be between 2 and 10")
+        if not 3 <= self.stream_history_scans <= 12:
+            raise ScannerError("STREAM_HISTORY_SCANS must be between 3 and 12")
 
 
 @dataclasses.dataclass(slots=True)
@@ -190,8 +245,31 @@ class TestResult:
     reason: str
     speed_mbps: float | None = None
     speed_samples: list[float] = dataclasses.field(default_factory=list)
+    speed_floor_mbps: float | None = None
     speed_confirmed_slow: bool = False
+    stream_attempts: int = 0
+    stream_completed: int = 0
+    stream_stalls: int = 0
+    stream_bytes_downloaded: int = 0
+    stream_deep_tested: bool = False
+    stream_quality: str = "unverified"
     exit_country: str | None = None
+
+
+@dataclasses.dataclass(slots=True)
+class StreamTestResult:
+    speed_mbps: float | None
+    speed_samples: list[float]
+    speed_floor_mbps: float | None
+    attempts: int
+    completed: int
+    stalls: int
+    bytes_downloaded: int
+    deep_tested: bool
+    quality: str
+    confirmed_slow: bool
+    reason: str
+    exit_country: str | None
 
 
 @dataclasses.dataclass(slots=True)
@@ -928,6 +1006,9 @@ def curl_measure(
     url: str,
     timeout: float,
     expected_min_bytes: int = 0,
+    maximum_bytes: int = 0,
+    low_speed_limit_bps: int = 0,
+    low_speed_seconds: int = 0,
 ) -> tuple[bool, dict[str, float | int | str], str]:
     marker = "__MEZA_METRICS__"
     fmt = marker + "%{http_code}\t%{time_starttransfer}\t%{time_total}\t%{size_download}\t%{speed_download}\n"
@@ -951,8 +1032,19 @@ def curl_measure(
         fmt,
         "--user-agent",
         "MezaVPN-Quality-Scanner/1.0",
-        url,
     ]
+    if low_speed_limit_bps > 0 and low_speed_seconds > 0:
+        command.extend(
+            [
+                "--speed-limit",
+                str(low_speed_limit_bps),
+                "--speed-time",
+                str(low_speed_seconds),
+            ]
+        )
+    if maximum_bytes > 0:
+        command.extend(["--max-filesize", str(maximum_bytes)])
+    command.extend(["--header", "Cache-Control: no-cache", url])
     try:
         completed = subprocess.run(
             command,
@@ -981,7 +1073,7 @@ def curl_measure(
     except ValueError:
         return False, {}, "unparseable curl metrics"
 
-    accepted_code = code in {200, 204}
+    accepted_code = code in {200, 204, 206}
     enough_data = size >= expected_min_bytes if expected_min_bytes else True
     ok = completed.returncode == 0 and accepted_code and enough_data
     metrics: dict[str, float | int | str] = {
@@ -1120,38 +1212,146 @@ def test_node(node: Node, xray_bin: str, settings: Settings) -> TestResult:
     )
 
 
+def assess_stream_quality(
+    samples: list[float],
+    attempts: int,
+    completed: int,
+    stalls: int,
+    deep_tested: bool,
+    settings: Settings,
+) -> tuple[str, bool, str]:
+    """Classify stream quality without treating one weak sample as certainty."""
+    valid = [float(value) for value in samples if math.isfinite(value) and value > 0]
+    confirmed_slow = (
+        len(valid) >= 2 and max(valid) < settings.min_speed_mbps
+    )
+    if confirmed_slow:
+        return "poor", True, "confirmed_slow"
+
+    # A completed short transfer followed by a failed sustained transfer is the
+    # exact burst-then-stall pattern that interrupts short-form video.
+    if stalls > 0:
+        if deep_tested or stalls >= 2:
+            return "unstable", False, "stream_stall"
+        return "unverified", False, "stream_unverified"
+
+    if not valid or completed == 0:
+        return "unverified", False, "stream_unverified"
+    if deep_tested and completed < attempts:
+        return "unverified", False, "stream_unverified"
+
+    floor = min(valid)
+    if floor >= settings.strong_speed_mbps:
+        return "strong", False, "ok"
+    if floor >= settings.good_speed_mbps:
+        return "good", False, "ok"
+    if floor >= settings.min_speed_mbps:
+        return "borderline", False, "stream_below_target"
+    return "poor", False, "stream_below_target"
+
+
+def _stream_measurement(
+    port: int, byte_count: int, settings: Settings
+) -> tuple[bool, float | None, int, bool]:
+    """Run one bounded transfer and return completion, Mbps, bytes and stall."""
+    minimum_bps = max(1, int(settings.min_speed_mbps * 1_000_000.0 / 8.0))
+    expected = int(byte_count * 0.90)
+    minimum_transfer_seconds = byte_count * 8.0 / (
+        settings.min_speed_mbps * 1_000_000.0
+    )
+    timeout = max(
+        10.0,
+        settings.probe_timeout_seconds + 3.0,
+        minimum_transfer_seconds * 1.7,
+    )
+    url = settings.speed_test_url.format(bytes=byte_count)
+    ok, metrics, _ = curl_measure(
+        port,
+        url,
+        timeout=timeout,
+        expected_min_bytes=expected,
+        maximum_bytes=byte_count,
+        low_speed_limit_bps=minimum_bps,
+        low_speed_seconds=settings.stream_low_speed_seconds,
+    )
+    downloaded = int(metrics.get("size_download", 0) or 0)
+    speed: float | None = None
+    total_seconds = float(metrics.get("total_seconds", 0.0) or 0.0)
+    ttfb_seconds = float(metrics.get("ttfb_seconds", 0.0) or 0.0)
+    body_seconds = total_seconds - ttfb_seconds
+    raw_speed = (
+        downloaded / body_seconds
+        if downloaded > 0 and body_seconds > 0.001
+        else float(metrics.get("speed_download", 0.0) or 0.0)
+    )
+    if raw_speed > 0 and math.isfinite(raw_speed):
+        speed = raw_speed * 8.0 / 1_000_000.0
+
+    # HTTP success with a partial body or curl's low-speed abort is meaningful
+    # evidence of a stream stall. Missing metrics are treated as unverified
+    # rather than as proof that the proxy itself is bad.
+    code = int(metrics.get("http_code", 0) or 0)
+    stalled = not ok and code in {200, 206} and downloaded < expected
+    return ok, speed if ok else None, downloaded, stalled
+
+
 def speed_test_node(
-    node: Node, xray_bin: str, settings: Settings
-) -> tuple[float | None, list[float], bool, str | None]:
+    node: Node,
+    xray_bin: str,
+    settings: Settings,
+    deep_test: bool = False,
+) -> StreamTestResult:
     samples: list[float] = []
+    attempts = 0
+    completed = 0
+    stalls = 0
+    bytes_downloaded = 0
     exit_country: str | None = None
     try:
         with XraySession(xray_bin, node, settings.xray_start_timeout_seconds) as port:
             exit_country = detect_exit_country(
                 port, min(6.0, settings.probe_timeout_seconds)
             )
-            url = settings.speed_test_url.format(bytes=settings.speed_test_bytes)
-            for _ in range(2):
-                ok, metrics, _ = curl_measure(
-                    port,
-                    url,
-                    timeout=max(8.0, settings.probe_timeout_seconds + 3.0),
-                    expected_min_bytes=int(settings.speed_test_bytes * 0.80),
+            transfer_sizes = [settings.speed_test_bytes]
+            if deep_test:
+                transfer_sizes.append(settings.stream_test_bytes)
+            for byte_count in transfer_sizes:
+                attempts += 1
+                ok, speed, downloaded, stalled = _stream_measurement(
+                    port, byte_count, settings
                 )
-                if ok:
-                    mbps = float(metrics["speed_download"]) * 8.0 / 1_000_000.0
-                    if math.isfinite(mbps) and mbps > 0:
-                        samples.append(mbps)
-                if samples and samples[-1] >= settings.min_speed_mbps:
-                    break
+                bytes_downloaded += downloaded
+                stalls += int(stalled)
+                if ok and speed is not None:
+                    completed += 1
+                    samples.append(speed)
     except Exception:
-        return None, [], False, exit_country
+        pass
 
-    if not samples:
-        return None, [], False, exit_country
-    measured = statistics.median(samples)
-    confirmed_slow = len(samples) >= 2 and max(samples) < settings.min_speed_mbps
-    return float(measured), samples, confirmed_slow, exit_country
+    quality, confirmed_slow, reason = assess_stream_quality(
+        samples,
+        attempts,
+        completed,
+        stalls,
+        deep_test,
+        settings,
+    )
+    measured = float(statistics.median(samples)) if samples else None
+    floor = float(min(samples)) if samples else None
+    return StreamTestResult(
+        speed_mbps=measured,
+        speed_samples=samples,
+        speed_floor_mbps=floor,
+        attempts=attempts,
+        completed=completed,
+        stalls=stalls,
+        bytes_downloaded=bytes_downloaded,
+        deep_tested=deep_test,
+        quality=quality,
+        confirmed_slow=confirmed_slow,
+        reason=reason,
+        exit_country=exit_country,
+    )
 
 
 def normalize_published_names(
@@ -1185,21 +1385,152 @@ def normalize_published_names(
     return detected, unknown
 
 
+def quality_for_speed(speed: float | None, settings: Settings) -> str:
+    if speed is None or not math.isfinite(float(speed)) or float(speed) <= 0:
+        return "unverified"
+    if float(speed) >= settings.strong_speed_mbps:
+        return "strong"
+    if float(speed) >= settings.good_speed_mbps:
+        return "good"
+    if float(speed) >= settings.min_speed_mbps:
+        return "borderline"
+    return "poor"
+
+
+def previous_stream_is_trusted(
+    record: dict[str, Any] | None, settings: Settings
+) -> bool:
+    if not isinstance(record, dict):
+        return False
+    if record.get("stream_verified") is True:
+        return True
+    if str(record.get("stream_quality", "")) in {"strong", "good"}:
+        return True
+    # Backward-compatible migration from scanner 1.1.x. Its tiny transfer is
+    # not called "verified", but a currently healthy node is allowed one
+    # provisional cycle instead of disappearing during the upgrade.
+    legacy_speed = record.get("speed_mbps")
+    return (
+        isinstance(legacy_speed, (int, float))
+        and float(legacy_speed) >= settings.good_speed_mbps
+    )
+
+
+def apply_stream_result(
+    result: TestResult,
+    stream: StreamTestResult | None,
+    previous: dict[str, Any] | None,
+    settings: Settings,
+) -> None:
+    if stream is not None:
+        result.speed_mbps = stream.speed_mbps
+        result.speed_samples = stream.speed_samples
+        result.speed_floor_mbps = stream.speed_floor_mbps
+        result.speed_confirmed_slow = stream.confirmed_slow
+        result.stream_attempts = stream.attempts
+        result.stream_completed = stream.completed
+        result.stream_stalls = stream.stalls
+        result.stream_bytes_downloaded = stream.bytes_downloaded
+        result.stream_deep_tested = stream.deep_tested
+        result.stream_quality = stream.quality
+        result.exit_country = stream.exit_country
+
+    if result.stream_quality in {"strong", "good"}:
+        return
+    if result.stream_quality == "unverified" and previous_stream_is_trusted(
+        previous, settings
+    ):
+        # A speed CDN/session failure does not prove a previously good proxy is
+        # bad. Keep it provisionally with a ranking penalty; current HTTPS
+        # health probes still had to pass.
+        return
+
+    result.passed = False
+    if stream is not None:
+        result.reason = stream.reason
+    else:
+        result.reason = "stream_unverified"
+
+
+def deep_test_priority(
+    result: TestResult,
+    previous: dict[str, Any] | None,
+) -> tuple[int, float, float, str]:
+    if isinstance(previous, dict):
+        old_quality = str(previous.get("stream_quality", ""))
+        old_failures = int(previous.get("stream_failure_streak", 0) or 0)
+        if old_failures > 0 or old_quality in {"poor", "borderline", "unstable"}:
+            group = 0
+        elif not previous.get("last_deep_test"):
+            group = 2
+        else:
+            group = 3
+        stamp = parse_iso(str(previous.get("last_deep_test", "")))
+        age_key = stamp.timestamp() if stamp is not None else 0.0
+    else:
+        group = 1
+        age_key = 0.0
+    return (
+        group,
+        age_key,
+        float(result.latency_ms or 99_999),
+        result.fingerprint,
+    )
+
+
+def stream_test_plan(candidate_count: int, settings: Settings) -> tuple[int, int, int]:
+    """Return quick count, deep count and a byte plan that never exceeds budget."""
+    quick_capacity = settings.speed_budget_bytes // settings.speed_test_bytes
+    quick_count = min(
+        max(0, candidate_count), settings.speed_test_max, quick_capacity
+    )
+    quick_bytes = quick_count * settings.speed_test_bytes
+    remaining = max(0, settings.speed_budget_bytes - quick_bytes)
+    deep_count = min(quick_count, remaining // settings.stream_test_bytes)
+    planned = quick_bytes + deep_count * settings.stream_test_bytes
+    return quick_count, deep_count, planned
+
+
 def record_score(record: dict[str, Any], settings: Settings) -> float:
     latency = float(record.get("latency_ms") or settings.max_latency_ms)
     jitter = float(record.get("jitter_ms") or 0.0)
     success_rate = float(record.get("success_rate") or 0.0)
-    speed = record.get("speed_mbps")
+    history_reliability = float(record.get("stream_reliability") or 0.0)
+    speed = record.get("stream_floor_mbps")
+    if not isinstance(speed, (int, float)) or float(speed) <= 0:
+        speed = record.get("speed_floor_mbps") or record.get("speed_mbps")
 
-    # Latency dominates ranking. Throughput only breaks close quality ties.
-    latency_score = max(0.0, 1.0 - latency / settings.max_latency_ms) * 100.0
-    stability_score = success_rate * 15.0 - min(10.0, jitter / 75.0)
-    elite_bonus = 15.0 if latency <= settings.elite_latency_ms else 0.0
-    speed_bonus = 0.0
-    if isinstance(speed, (int, float)) and speed > 0:
-        speed_bonus = min(8.0, math.log2(1.0 + float(speed)) * 2.0)
-    grace_penalty = 30.0 if record.get("status") == "grace" else 0.0
-    return round(latency_score + stability_score + elite_bonus + speed_bonus - grace_penalty, 5)
+    # For a globally distributed client, intrinsic reliability and sustained
+    # throughput matter more than latency from one Azure runner. The app still
+    # performs the final region-specific latency choice.
+    health_score = success_rate * 22.0
+    history_score = history_reliability * 23.0
+    speed_score = 0.0
+    if isinstance(speed, (int, float)) and float(speed) > 0:
+        speed_score = min(35.0, float(speed) / settings.strong_speed_mbps * 35.0)
+    latency_score = max(0.0, 1.0 - latency / settings.max_latency_ms) * 15.0
+    verified_bonus = 7.0 if record.get("stream_verified") is True else 0.0
+    jitter_penalty = min(8.0, jitter / max(1.0, settings.max_jitter_ms) * 8.0)
+
+    quality = str(record.get("stream_quality", "unverified"))
+    quality_penalty = {
+        "unverified": 12.0,
+        "borderline": 18.0,
+        "poor": 30.0,
+        "unstable": 35.0,
+    }.get(quality, 0.0)
+    grace_penalty = 24.0 if record.get("status") in {"grace", "preserved"} else 0.0
+    return round(
+        health_score
+        + history_score
+        + speed_score
+        + latency_score
+        + verified_bonus
+        - jitter_penalty
+        - quality_penalty
+        - grace_penalty,
+        5,
+    )
 
 
 def parse_iso(value: str | None) -> dt.datetime | None:
@@ -1219,7 +1550,97 @@ def previous_record_is_fresh(record: dict[str, Any], settings: Settings) -> bool
     return age <= dt.timedelta(minutes=settings.grace_max_age_minutes)
 
 
-def make_record(node: Node, result: TestResult, now: str) -> dict[str, Any]:
+def _history_floor(entries: list[dict[str, Any]]) -> float | None:
+    values = sorted(
+        float(entry["floor_mbps"])
+        for entry in entries
+        if isinstance(entry.get("floor_mbps"), (int, float))
+        and float(entry["floor_mbps"]) > 0
+    )
+    if not values:
+        return None
+    index = int(math.floor((len(values) - 1) * 0.25))
+    return values[index]
+
+
+def make_record(
+    node: Node,
+    result: TestResult,
+    now: str,
+    previous: dict[str, Any] | None,
+    settings: Settings,
+) -> dict[str, Any]:
+    history: list[dict[str, Any]] = []
+    if isinstance(previous, dict):
+        raw_history = previous.get("stream_history")
+        if isinstance(raw_history, list):
+            history = [dict(item) for item in raw_history if isinstance(item, dict)]
+        elif isinstance(previous.get("speed_mbps"), (int, float)):
+            legacy_speed = float(previous["speed_mbps"])
+            history.append(
+                {
+                    "at": str(previous.get("last_success", now)),
+                    "quality": quality_for_speed(legacy_speed, settings),
+                    "floor_mbps": round(legacy_speed, 3),
+                    "stalls": 0,
+                    "deep": False,
+                    "legacy": True,
+                }
+            )
+
+    if result.stream_attempts > 0:
+        history.append(
+            {
+                "at": now,
+                "quality": result.stream_quality,
+                "floor_mbps": (
+                    round(result.speed_floor_mbps, 3)
+                    if result.speed_floor_mbps is not None
+                    else None
+                ),
+                "stalls": result.stream_stalls,
+                "deep": result.stream_deep_tested,
+            }
+        )
+    history = history[-settings.stream_history_scans :]
+
+    decided = [
+        item
+        for item in history
+        if str(item.get("quality", "")) != "unverified"
+    ]
+    good_count = sum(
+        1 for item in decided if str(item.get("quality")) in {"strong", "good"}
+    )
+    reliability = good_count / len(decided) if decided else 0.0
+    failure_streak = 0
+    for item in reversed(history):
+        quality = str(item.get("quality", "unverified"))
+        if quality in {"poor", "borderline", "unstable"}:
+            failure_streak += 1
+        elif quality in {"strong", "good"}:
+            break
+    verified = any(
+        bool(item.get("deep"))
+        and str(item.get("quality")) in {"strong", "good"}
+        for item in history
+    ) or (good_count >= 3 and reliability >= 0.75)
+
+    last_deep_test = (
+        now
+        if result.stream_deep_tested
+        else (str(previous.get("last_deep_test", "")) if isinstance(previous, dict) else "")
+    )
+    historical_floor = _history_floor(history)
+    current_speed = (
+        round(result.speed_mbps, 3) if result.speed_mbps is not None else None
+    )
+    if current_speed is None and isinstance(previous, dict):
+        old_speed = previous.get("speed_mbps")
+        current_speed = (
+            round(float(old_speed), 3) if isinstance(old_speed, (int, float)) else None
+        )
+
     return {
         "uri": node.uri,
         "protocol": node.protocol,
@@ -1232,7 +1653,21 @@ def make_record(node: Node, result: TestResult, now: str) -> dict[str, Any]:
         "jitter_ms": round(float(result.jitter_ms or 0.0), 2),
         "success_rate": round(float(result.success_rate), 4),
         "attempts": result.attempt_count,
-        "speed_mbps": round(result.speed_mbps, 3) if result.speed_mbps is not None else None,
+        "speed_mbps": current_speed,
+        "speed_floor_mbps": (
+            round(result.speed_floor_mbps, 3)
+            if result.speed_floor_mbps is not None
+            else None
+        ),
+        "stream_quality": result.stream_quality,
+        "stream_verified": verified,
+        "stream_reliability": round(reliability, 4),
+        "stream_failure_streak": failure_streak,
+        "stream_floor_mbps": (
+            round(historical_floor, 3) if historical_floor is not None else None
+        ),
+        "stream_history": history,
+        "last_deep_test": last_deep_test or None,
     }
 
 
@@ -1294,6 +1729,11 @@ a{{display:inline-block;margin-right:14px}}
         f"- Broken/rejected: `{status['broken']['total']}`",
         f"- Elite (≤ {settings.elite_latency_ms:.0f} ms): `{status['quality']['elite']}`",
         f"- Acceptable (≤ {settings.max_latency_ms:.0f} ms): `{status['quality']['acceptable']}`",
+        f"- Stream strong (≥ {settings.strong_speed_mbps:g} Mbps): `{status['quality']['stream_strong']}`",
+        f"- Stream good (≥ {settings.good_speed_mbps:g} Mbps): `{status['quality']['stream_good']}`",
+        f"- Stream stalls rejected: `{status['broken']['stream_stall']}`",
+        f"- Stream-test traffic: `{status['stream_test']['actual_downloaded_bytes'] / 1_048_576:.1f} MiB` "
+        f"(cap `{settings.speed_budget_bytes / 1_048_576:.0f} MiB`)",
         f"- Safety mode: `{status['safety_mode']}`",
     ]
     (output_dir / "summary.md").write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
@@ -1398,32 +1838,75 @@ def run(args: argparse.Namespace) -> int:
             executor.shutdown(wait=True, cancel_futures=True)
 
     passed_results = [result for result in results.values() if result.passed]
+    health_passed_current = len(passed_results)
+    quick_count, deep_slots, planned_stream_bytes = stream_test_plan(
+        len(passed_results), settings
+    )
     speed_candidates = sorted(
         passed_results,
         key=lambda item: (
-            0 if (item.latency_ms or 99_999) <= settings.elite_latency_ms else 1,
+            0 if item.fingerprint in previous_selected else 1,
+            0
+            if previous_stream_is_trusted(
+                previous_nodes.get(item.fingerprint), settings
+            )
+            else 1,
             item.latency_ms or 99_999,
             item.jitter_ms or 99_999,
+            item.fingerprint,
         ),
-    )[: settings.speed_test_max]
+    )[:quick_count]
+    deep_candidates = sorted(
+        speed_candidates,
+        key=lambda item: deep_test_priority(
+            item, previous_nodes.get(item.fingerprint)
+        ),
+    )[:deep_slots]
+    deep_fingerprints = {item.fingerprint for item in deep_candidates}
+    stream_outcomes: dict[str, StreamTestResult] = {}
 
     if speed_candidates and time.monotonic() < deadline:
-        log(f"Running small speed tests on {len(speed_candidates)} top candidates...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=settings.speed_workers) as executor:
+        log(
+            f"Running budgeted stream tests on {len(speed_candidates)} candidates "
+            f"({len(deep_fingerprints)} deep; max {planned_stream_bytes / 1_048_576:.1f} MiB)..."
+        )
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=settings.speed_workers
+        ) as executor:
             future_map = {
-                executor.submit(speed_test_node, nodes[result.fingerprint], xray_bin, settings): result
+                executor.submit(
+                    speed_test_node,
+                    nodes[result.fingerprint],
+                    xray_bin,
+                    settings,
+                    result.fingerprint in deep_fingerprints,
+                ): result
                 for result in speed_candidates
             }
             for future in concurrent.futures.as_completed(future_map):
                 result = future_map[future]
-                speed, samples, confirmed_slow, exit_country = future.result()
-                result.speed_mbps = speed
-                result.speed_samples = samples
-                result.speed_confirmed_slow = confirmed_slow
-                result.exit_country = exit_country
-                if confirmed_slow:
-                    result.passed = False
-                    result.reason = "confirmed_slow"
+                stream_outcomes[result.fingerprint] = future.result()
+
+    for result in passed_results:
+        apply_stream_result(
+            result,
+            stream_outcomes.get(result.fingerprint),
+            previous_nodes.get(result.fingerprint),
+            settings,
+        )
+
+    completed_stream_nodes = sum(
+        1 for stream in stream_outcomes.values() if stream.completed > 0
+    )
+    stream_endpoint_degraded = (
+        len(stream_outcomes) >= 10
+        and completed_stream_nodes / len(stream_outcomes) < 0.15
+    )
+    if stream_endpoint_degraded:
+        log(
+            "Warning: the stream endpoint appears degraded; only previously "
+            "trusted nodes may pass without a current transfer result."
+        )
 
     now = iso_now()
     current_records: dict[str, dict[str, Any]] = {}
@@ -1433,7 +1916,13 @@ def run(args: argparse.Namespace) -> int:
     for fingerprint, node in nodes.items():
         result = results.get(fingerprint)
         if result is not None and result.passed:
-            record = make_record(node, result, now)
+            record = make_record(
+                node,
+                result,
+                now,
+                previous_nodes.get(fingerprint),
+                settings,
+            )
             current_records[fingerprint] = record
             passed_current += 1
             continue
@@ -1444,8 +1933,7 @@ def run(args: argparse.Namespace) -> int:
             and (result is None or result.success_count >= 1)
             and (
                 result is None
-                or result.reason
-                not in {"confirmed_unreachable", "consistently_high_latency", "confirmed_slow"}
+                or result.reason not in HARD_REJECTION_REASONS
             )
             and int(previous.get("failure_streak", 0) or 0) < settings.grace_scans
             and previous_record_is_fresh(previous, settings)
@@ -1485,7 +1973,12 @@ def run(args: argparse.Namespace) -> int:
     ]
     eligible.sort(
         key=lambda record: (
-            0 if float(record.get("latency_ms") or 99_999) <= settings.elite_latency_ms else 1,
+            0 if record.get("stream_verified") is True else 1,
+            {
+                "strong": 0,
+                "good": 1,
+                "unverified": 2,
+            }.get(str(record.get("stream_quality", "unverified")), 3),
             -float(record.get("score") or 0),
             float(record.get("latency_ms") or 99_999),
             str(record.get("fingerprint")),
@@ -1505,8 +1998,10 @@ def run(args: argparse.Namespace) -> int:
         result = results.get(fingerprint)
         if result is not None and (
             result.success_count == 0
-            or result.reason in {"consistently_high_latency", "confirmed_slow"}
+            or result.reason in HARD_REJECTION_REASONS
         ):
+            continue
+        if result is None and not previous_stream_is_trusted(previous, settings):
             continue
         previous_selected_records.append(dict(previous, fingerprint=fingerprint))
     suspicious = False
@@ -1539,6 +2034,21 @@ def run(args: argparse.Namespace) -> int:
     )
     tested_rejected = sum(rejection_reasons.values())
     broken_total = unsupported + invalid + tested_rejected
+    stream_quality_counts = collections.Counter(
+        str(record.get("stream_quality", "unverified")) for record in selected
+    )
+    stream_actual_bytes = sum(
+        stream.bytes_downloaded for stream in stream_outcomes.values()
+    )
+    stream_completed_transfers = sum(
+        stream.completed for stream in stream_outcomes.values()
+    )
+    stream_stalled_transfers = sum(
+        stream.stalls for stream in stream_outcomes.values()
+    )
+    stream_verified_count = sum(
+        1 for record in selected if record.get("stream_verified") is True
+    )
     status = {
         "generated_at": now,
         "scanner_version": SCANNER_VERSION,
@@ -1555,6 +2065,7 @@ def run(args: argparse.Namespace) -> int:
             "unsupported": unsupported,
             "invalid": invalid,
             "tested": len(results),
+            "health_passed": health_passed_current,
             "passed_current": passed_current,
             "grace_retained": grace_count,
             "published": len(selected),
@@ -1569,6 +2080,9 @@ def run(args: argparse.Namespace) -> int:
             + rejection_reasons["unstable_jitter"],
             "consistently_high_latency": rejection_reasons["consistently_high_latency"],
             "confirmed_slow": rejection_reasons["confirmed_slow"],
+            "stream_stall": rejection_reasons["stream_stall"],
+            "stream_below_target": rejection_reasons["stream_below_target"],
+            "stream_unverified": rejection_reasons["stream_unverified"],
             "other_test_failures": tested_rejected
             - sum(
                 rejection_reasons[key]
@@ -1579,6 +2093,9 @@ def run(args: argparse.Namespace) -> int:
                     "unstable_jitter",
                     "consistently_high_latency",
                     "confirmed_slow",
+                    "stream_stall",
+                    "stream_below_target",
+                    "stream_unverified",
                 )
             ),
             "note": "Duplicates are not counted as broken; unsupported external protocols are not extracted by this scanner.",
@@ -1589,11 +2106,35 @@ def run(args: argparse.Namespace) -> int:
             "elite_threshold_ms": settings.elite_latency_ms,
             "maximum_threshold_ms": settings.max_latency_ms,
             "maximum_jitter_ms": settings.max_jitter_ms,
+            "stream_strong": stream_quality_counts["strong"],
+            "stream_good": stream_quality_counts["good"],
+            "stream_provisional": stream_quality_counts["unverified"],
+            "stream_verified": stream_verified_count,
         },
         "speed_test": {
-            "tested": len(speed_candidates),
+            "tested": len(stream_outcomes),
             "sample_bytes": settings.speed_test_bytes,
-            "confirmed_slow_removed": sum(1 for result in speed_candidates if result.speed_confirmed_slow),
+            "confirmed_slow_removed": rejection_reasons["confirmed_slow"],
+        },
+        "stream_test": {
+            "mode": "quick transfer for every budgeted healthy candidate plus rotating sustained transfer",
+            "tested_nodes": len(stream_outcomes),
+            "deep_tested_nodes": sum(
+                1 for stream in stream_outcomes.values() if stream.deep_tested
+            ),
+            "completed_transfers": stream_completed_transfers,
+            "stalled_transfers": stream_stalled_transfers,
+            "endpoint_degraded": stream_endpoint_degraded,
+            "quick_bytes": settings.speed_test_bytes,
+            "deep_bytes": settings.stream_test_bytes,
+            "planned_bytes": planned_stream_bytes,
+            "actual_downloaded_bytes": stream_actual_bytes,
+            "budget_bytes": settings.speed_budget_bytes,
+            "minimum_mbps": settings.min_speed_mbps,
+            "good_mbps": settings.good_speed_mbps,
+            "strong_mbps": settings.strong_speed_mbps,
+            "low_speed_window_seconds": settings.stream_low_speed_seconds,
+            "history_scans": settings.stream_history_scans,
         },
         "naming": {
             "format": "FLAG CC | Server N",

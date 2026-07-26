@@ -102,6 +102,26 @@ class ScannerParserTests(unittest.TestCase):
         links = scanner.extract_links(decoded)
         self.assertEqual(len(links), 2)
 
+    def test_private_and_additional_sources_are_merged_and_deduplicated(self):
+        first = "https://example.com/private-one"
+        second = "https://example.com/private-two"
+        public = (
+            "https://raw.githubusercontent.com/MahsaNetConfigTopic/config/"
+            "refs/heads/main/xray_final.txt"
+        )
+        with mock.patch.dict(
+            scanner.os.environ,
+            {
+                "SUB_URLS": f"{first}\n{second}\n{public}",
+                "ADDITIONAL_SUB_URLS": public,
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                scanner.configured_source_urls(),
+                [first, second, public],
+            )
+
     def test_html_escaped_query_separators_are_restored(self):
         raw = (
             f"vless://{UUID}@example.com:443?security=tls&amp;sni=cdn.example.com"
@@ -198,6 +218,10 @@ class ScannerParserTests(unittest.TestCase):
         self.assertEqual(settings.good_speed_mbps, 1.5)
         self.assertEqual(settings.strong_speed_mbps, 2.5)
         self.assertEqual(settings.speed_budget_bytes, 96 * 1024 * 1024)
+        self.assertEqual(settings.speed_retry_reserve_bytes, 12 * 1024 * 1024)
+        self.assertEqual(
+            settings.speed_retry_url, "https://proof.ovh.net/files/1Mb.dat"
+        )
 
     def test_stream_reliability_dominates_small_latency_difference(self):
         settings = scanner.Settings.from_env()
@@ -270,6 +294,56 @@ class ScannerParserTests(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertEqual(result.reason, "stream_unverified")
 
+    def test_unverified_previous_node_gets_only_one_provisional_scan(self):
+        result = scanner.TestResult("abc", True, 3, 3, 200.0, 20.0, 1.0, "ok")
+        scanner.apply_stream_result(
+            result,
+            scanner.StreamTestResult(
+                None, [], None, 1, 0, 0, 0, False,
+                "unverified", False, "stream_unverified", None,
+            ),
+            {
+                "stream_quality": "strong",
+                "stream_verified": True,
+                "stream_uncertain_streak": 1,
+            },
+            scanner.Settings(),
+        )
+        self.assertFalse(result.passed)
+        self.assertEqual(result.reason, "stream_unverified")
+
+    def test_one_weak_sample_gets_one_chance_but_not_indefinitely(self):
+        stream = scanner.StreamTestResult(
+            0.9, [0.9], 0.9, 2, 1, 0, 262144, False,
+            "poor", False, "stream_below_target", None,
+        )
+        first = scanner.TestResult(
+            "abc", True, 3, 3, 200.0, 20.0, 1.0, "ok"
+        )
+        scanner.apply_stream_result(
+            first,
+            stream,
+            {"stream_quality": "strong", "stream_verified": True},
+            scanner.Settings(),
+        )
+        self.assertTrue(first.passed)
+
+        repeated = scanner.TestResult(
+            "abc", True, 3, 3, 200.0, 20.0, 1.0, "ok"
+        )
+        scanner.apply_stream_result(
+            repeated,
+            stream,
+            {
+                "stream_quality": "strong",
+                "stream_verified": True,
+                "stream_failure_streak": 1,
+            },
+            scanner.Settings(),
+        )
+        self.assertFalse(repeated.passed)
+        self.assertEqual(repeated.reason, "stream_below_target")
+
     def test_previous_good_does_not_override_current_stream_stall(self):
         result = scanner.TestResult("abc", True, 3, 3, 200.0, 20.0, 1.0, "ok")
         scanner.apply_stream_result(
@@ -320,6 +394,7 @@ class ScannerParserTests(unittest.TestCase):
                 10.0,
                 expected_min_bytes=200000,
                 maximum_bytes=262144,
+                byte_range="0-262143",
                 low_speed_limit_bps=137500,
                 low_speed_seconds=3,
             )
@@ -329,16 +404,116 @@ class ScannerParserTests(unittest.TestCase):
         self.assertEqual(command[command.index("--speed-limit") + 1], "137500")
         self.assertIn("--speed-time", command)
         self.assertIn("--max-filesize", command)
+        self.assertIn("--range", command)
+        self.assertEqual(command[command.index("--range") + 1], "0-262143")
         self.assertIn("Cache-Control: no-cache", command)
 
     def test_stream_plan_never_exceeds_network_budget(self):
         settings = scanner.Settings()
         for candidates in (0, 1, 100, 214, 450, 5000):
-            with self.subTest(candidates=candidates):
-                quick, deep, planned = scanner.stream_test_plan(candidates, settings)
-                self.assertLessEqual(planned, settings.speed_budget_bytes)
-                self.assertLessEqual(deep, quick)
-                self.assertLessEqual(quick, settings.speed_test_max)
+            primary = scanner.initial_stream_test_count(candidates, settings)
+            for retry_needed in (0, primary // 5, primary):
+                with self.subTest(
+                    candidates=candidates, retry_needed=retry_needed
+                ):
+                    retry, deep, planned = scanner.followup_stream_test_plan(
+                        primary, retry_needed, settings
+                    )
+                    self.assertLessEqual(planned, settings.speed_budget_bytes)
+                    self.assertLessEqual(retry, retry_needed)
+                    self.assertLessEqual(deep, primary)
+                    self.assertLessEqual(primary, settings.speed_test_max)
+
+    def test_independent_retry_can_recover_an_unverified_primary(self):
+        settings = scanner.Settings()
+        primary = scanner.StreamTestResult(
+            None, [], None, 1, 0, 0, 0, False,
+            "unverified", False, "stream_unverified", None,
+        )
+        fallback = scanner.StreamTestResult(
+            2.0, [2.0], 2.0, 1, 1, 0, 262144, False,
+            "good", False, "ok", "DE",
+        )
+        combined = scanner.combine_stream_results(
+            primary, fallback, settings, multi_endpoint_retry=True
+        )
+        self.assertEqual(combined.quality, "good")
+        self.assertEqual(combined.reason, "ok")
+        self.assertEqual(combined.exit_country, "DE")
+
+    def test_two_independent_failures_are_hard_rejection(self):
+        settings = scanner.Settings()
+        failed = scanner.StreamTestResult(
+            None, [], None, 1, 0, 0, 0, False,
+            "unverified", False, "stream_unverified", None,
+        )
+        combined = scanner.combine_stream_results(
+            failed, failed, settings, multi_endpoint_retry=True
+        )
+        self.assertEqual(combined.reason, "stream_multi_endpoint_failed")
+        self.assertIn(combined.reason, scanner.HARD_REJECTION_REASONS)
+
+        result = scanner.TestResult(
+            "abc", True, 3, 3, 200.0, 20.0, 1.0, "ok"
+        )
+        scanner.apply_stream_result(
+            result,
+            combined,
+            {"stream_quality": "strong", "stream_verified": True},
+            settings,
+        )
+        self.assertFalse(result.passed)
+        self.assertEqual(result.reason, "stream_multi_endpoint_failed")
+
+    def test_three_samples_ignore_one_low_outlier(self):
+        settings = scanner.Settings()
+        primary = scanner.StreamTestResult(
+            0.9, [0.9], 0.9, 1, 1, 0, 262144, False,
+            "poor", False, "stream_below_target", None,
+        )
+        fallback = scanner.StreamTestResult(
+            2.55, [2.5, 2.6], 2.5, 2, 2, 0, 1310720, True,
+            "strong", False, "ok", None,
+        )
+        combined = scanner.combine_stream_results(
+            primary, fallback, settings, multi_endpoint_retry=True
+        )
+        self.assertEqual(combined.quality, "strong")
+        self.assertEqual(combined.speed_floor_mbps, 2.5)
+
+    def test_two_conflicting_endpoints_remain_unverified(self):
+        quality, confirmed, reason = scanner.assess_stream_quality(
+            [0.9, 2.4], 2, 2, 0, False, scanner.Settings()
+        )
+        self.assertEqual(
+            (quality, confirmed, reason),
+            ("unverified", False, "stream_inconsistent"),
+        )
+
+    def test_one_stall_with_two_good_transfers_is_capped_at_good(self):
+        quality, confirmed, reason = scanner.assess_stream_quality(
+            [3.0, 2.8], 3, 2, 1, True, scanner.Settings()
+        )
+        self.assertEqual((quality, confirmed, reason), ("good", False, "ok"))
+
+    def test_ovh_measurement_uses_exact_http_range(self):
+        completed = mock.Mock(
+            returncode=0,
+            stdout="__MEZA_METRICS__206\t0.1\t0.5\t262144\t524288\n",
+            stderr="",
+        )
+        with mock.patch.object(scanner.subprocess, "run", return_value=completed) as run:
+            ok, _, downloaded, _ = scanner._stream_measurement(
+                19080,
+                262144,
+                scanner.Settings(),
+                endpoint_url="https://proof.ovh.net/files/1Mb.dat",
+                use_range=True,
+            )
+        self.assertTrue(ok)
+        self.assertEqual(downloaded, 262144)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--range") + 1], "0-262143")
 
     def test_stream_speed_excludes_connection_startup_time(self):
         metrics = {

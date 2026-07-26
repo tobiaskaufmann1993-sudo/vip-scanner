@@ -17,6 +17,8 @@ concurrency:
 
 env:
   XRAY_VERSION: "v26.3.27"
+  # Public feeds can be tracked here; private feeds remain in the SUB_URLS secret.
+  ADDITIONAL_SUB_URLS: "https://raw.githubusercontent.com/MahsaNetConfigTopic/config/refs/heads/main/xray_final.txt"
   # Broad health filter only; the client performs final regional selection.
   ELITE_LATENCY_MS: "800"
   MAX_LATENCY_MS: "3000"
@@ -31,6 +33,9 @@ env:
   SPEED_TEST_BYTES: "262144"
   STREAM_TEST_BYTES: "1048576"
   SPEED_BUDGET_BYTES: "100663296"
+  # Reserve part of the same 96 MiB cap for an independent OVH retry.
+  SPEED_RETRY_RESERVE_BYTES: "12582912"
+  SPEED_RETRY_URL: "https://proof.ovh.net/files/1Mb.dat"
   MIN_SPEED_MBPS: "1.1"
   GOOD_SPEED_MBPS: "1.5"
   STRONG_SPEED_MBPS: "2.5"

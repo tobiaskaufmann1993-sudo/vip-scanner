@@ -1,1 +1,3 @@
-# The scanner intentionally uses only Python's standard library.
+# Local, quota-free GeoIP lookup and Cloudflare-colo corroboration.
+maxminddb==3.1.1
+airportsdata==20260315

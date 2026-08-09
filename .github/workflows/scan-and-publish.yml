@@ -45,6 +45,9 @@ env:
   GRACE_MAX_AGE_MINUTES: "120"
   MAX_SCAN_SECONDS: "2220"
   OUTPUT_FORMAT: "base64"
+  GEOIP_DB_PATH: ".cache/geoip/dbip-city-lite.mmdb"
+  # City is published only when DB-IP and the live Cloudflare route agree.
+  GEO_CITY_MAX_DISTANCE_KM: "80"
 
 jobs:
   freshness:
@@ -110,6 +113,47 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: pip
+
+      - name: Install scanner dependencies
+        run: python -m pip install --requirement requirements.txt
+
+      - name: Select monthly GeoIP database release
+        id: geoip_release
+        shell: bash
+        run: |
+          set -euo pipefail
+          month="$(date -u +%Y-%m)"
+          url="https://download.db-ip.com/free/dbip-city-lite-${month}.mmdb.gz"
+          if ! curl --fail --silent --head --location --max-time 15 "$url" > /dev/null; then
+            month="$(date -u --date='1 month ago' +%Y-%m)"
+          fi
+          echo "month=$month" >> "$GITHUB_OUTPUT"
+
+      - name: Restore cached DB-IP City database
+        id: geoip_cache
+        uses: actions/cache@v5
+        with:
+          path: .cache/geoip/dbip-city-lite.mmdb
+          key: dbip-city-lite-${{ steps.geoip_release.outputs.month }}
+
+      - name: Download monthly DB-IP City database
+        if: steps.geoip_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .cache/geoip
+          month="${{ steps.geoip_release.outputs.month }}"
+          url="https://download.db-ip.com/free/dbip-city-lite-${month}.mmdb.gz"
+          curl --fail --location --retry 3 --retry-delay 3 \
+            --output /tmp/dbip-city-lite.mmdb.gz "$url"
+          gzip --test /tmp/dbip-city-lite.mmdb.gz
+          gzip --decompress --stdout /tmp/dbip-city-lite.mmdb.gz \
+            > "$GEOIP_DB_PATH"
+
+      - name: Validate local GeoIP database
+        run: |
+          python -c 'import maxminddb, os; p=os.environ["GEOIP_DB_PATH"]; r=maxminddb.open_database(p); assert r.metadata().ip_version in (4, 6); r.close(); print(f"DB-IP ready: {os.path.getsize(p) / 1048576:.1f} MiB")'
 
       - name: Run parser tests
         run: python -m unittest discover -s tests -v

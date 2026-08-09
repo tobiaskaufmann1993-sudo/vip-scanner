@@ -21,6 +21,7 @@ import dataclasses
 import datetime as dt
 import hashlib
 import html
+import ipaddress
 import json
 import math
 import os
@@ -41,8 +42,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 SUPPORTED_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://")
-SCANNER_VERSION = "1.2.2"
+SCANNER_VERSION = "1.3.2"
 UTC = dt.timezone.utc
+SERVER_ID_MIN = 1000
+SERVER_ID_FOUR_DIGIT_MAX = 9999
+SERVER_ID_MAX = 99999
 HARD_REJECTION_REASONS = frozenset(
     {
         "confirmed_unreachable",
@@ -97,6 +101,8 @@ class Settings:
     catastrophic_ratio: float = 0.15
     max_scan_seconds: int = 1_320
     output_format: str = "base64"
+    geoip_db_path: str = ".cache/geoip/dbip-city-lite.mmdb"
+    geo_city_max_distance_km: float = 80.0
     speed_test_url: str = "https://speed.cloudflare.com/__down?bytes={bytes}"
     speed_retry_url: str = "https://proof.ovh.net/files/1Mb.dat"
     probe_urls: tuple[str, ...] = (
@@ -171,6 +177,12 @@ class Settings:
             ),
             max_scan_seconds=env_int("MAX_SCAN_SECONDS", defaults.max_scan_seconds),
             output_format=os.getenv("OUTPUT_FORMAT", defaults.output_format).strip().lower(),
+            geoip_db_path=os.getenv(
+                "GEOIP_DB_PATH", defaults.geoip_db_path
+            ).strip(),
+            geo_city_max_distance_km=env_float(
+                "GEO_CITY_MAX_DISTANCE_KM", defaults.geo_city_max_distance_km
+            ),
             speed_test_url=os.getenv("SPEED_TEST_URL", defaults.speed_test_url).strip(),
             speed_retry_url=os.getenv(
                 "SPEED_RETRY_URL", defaults.speed_retry_url
@@ -227,6 +239,8 @@ class Settings:
             raise ScannerError("STREAM_LOW_SPEED_SECONDS must be between 2 and 10")
         if not 3 <= self.stream_history_scans <= 12:
             raise ScannerError("STREAM_HISTORY_SCANS must be between 3 and 12")
+        if not 10 <= self.geo_city_max_distance_km <= 250:
+            raise ScannerError("GEO_CITY_MAX_DISTANCE_KM must be between 10 and 250")
 
 
 @dataclasses.dataclass(slots=True)
@@ -271,6 +285,10 @@ class TestResult:
     stream_deep_tested: bool = False
     stream_quality: str = "unverified"
     exit_country: str | None = None
+    exit_ip: str | None = None
+    exit_country_name: str | None = None
+    exit_city: str | None = None
+    geo_city_confident: bool = False
 
 
 @dataclasses.dataclass(slots=True)
@@ -287,6 +305,26 @@ class StreamTestResult:
     confirmed_slow: bool
     reason: str
     exit_country: str | None
+    exit_ip: str | None = None
+    exit_country_name: str | None = None
+    exit_city: str | None = None
+    geo_city_confident: bool = False
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class ExitTrace:
+    ip: str | None
+    country: str | None
+    colo: str | None
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class ExitGeo:
+    ip: str | None
+    country_code: str | None
+    country_name: str | None
+    city: str | None
+    city_confident: bool
 
 
 @dataclasses.dataclass(slots=True)
@@ -1089,7 +1127,7 @@ def curl_measure(
             check=False,
             text=True,
         )
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, OSError):
         return False, {}, "curl timeout"
 
     output = completed.stdout
@@ -1139,8 +1177,8 @@ def probe_once(port: int, url: str, settings: Settings) -> ProbeSample:
     )
 
 
-def detect_exit_country(socks_port: int, timeout: float) -> str | None:
-    """Return the proxy egress ISO country reported by Cloudflare trace."""
+def detect_exit_trace(socks_port: int, timeout: float) -> ExitTrace:
+    """Return the actual proxy egress IP, country and Cloudflare colo."""
     command = [
         "curl", "--silent", "--show-error", "--fail", "--http1.1",
         "--proxy", f"socks5h://127.0.0.1:{socks_port}",
@@ -1158,12 +1196,193 @@ def detect_exit_country(socks_port: int, timeout: float) -> str | None:
             text=True,
         )
     except subprocess.TimeoutExpired:
-        return None
+        return ExitTrace(None, None, None)
     if completed.returncode != 0:
+        return ExitTrace(None, None, None)
+    fields = {
+        key.strip(): value.strip()
+        for key, value in (
+            line.split("=", 1)
+            for line in completed.stdout.splitlines()
+            if "=" in line
+        )
+    }
+    raw_ip = fields.get("ip", "")
+    try:
+        exit_ip = str(ipaddress.ip_address(raw_ip))
+    except ValueError:
+        exit_ip = None
+    raw_country = fields.get("loc", "").upper()
+    country = raw_country if raw_country in ISO_COUNTRY_CODES else None
+    raw_colo = fields.get("colo", "").upper()
+    colo = raw_colo if re.fullmatch(r"[A-Z0-9]{3}", raw_colo) else None
+    return ExitTrace(exit_ip, country, colo)
+
+
+def detect_exit_country(socks_port: int, timeout: float) -> str | None:
+    """Backward-compatible country-only wrapper used by older callers/tests."""
+    return detect_exit_trace(socks_port, timeout).country
+
+
+def country_display_name(code: str | None, suggested: str | None = None) -> str:
+    """Return a short English country label suitable for a VPN server list."""
+    normalized_code = (code or "").upper()
+    preferred_labels = {
+        "US": "USA",
+        "AE": "UAE",
+    }
+    if normalized_code in preferred_labels:
+        return preferred_labels[normalized_code]
+    clean_suggested = re.sub(r"[·#\r\n]+", " ", suggested or "").strip()
+    if clean_suggested and len(clean_suggested) <= 48:
+        return clean_suggested
+    for alias, alias_code in COUNTRY_NAME_ALIASES.items():
+        if alias_code == normalized_code:
+            return alias.title()
+    return normalized_code or "Unknown"
+
+
+def city_display_name(value: str | None) -> str | None:
+    clean = re.sub(r"[·#\r\n]+", " ", value or "").strip()[:64]
+    if not clean:
         return None
-    match = re.search(r"(?m)^loc=([A-Z]{2})\s*$", completed.stdout)
-    code = match.group(1) if match else ""
-    return code if code in ISO_COUNTRY_CODES else None
+    aliases = {
+        "frankfurt am main": "Frankfurt",
+        "new york city": "New York",
+        "washington, d.c.": "Washington DC",
+    }
+    return aliases.get(clean.casefold(), clean)
+
+
+def _haversine_km(
+    first_lat: float, first_lon: float, second_lat: float, second_lon: float
+) -> float:
+    radius_km = 6371.0088
+    lat1, lat2 = math.radians(first_lat), math.radians(second_lat)
+    delta_lat = math.radians(second_lat - first_lat)
+    delta_lon = math.radians(second_lon - first_lon)
+    value = (
+        math.sin(delta_lat / 2.0) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lon / 2.0) ** 2
+    )
+    return radius_km * 2.0 * math.asin(min(1.0, math.sqrt(value)))
+
+
+def corroborate_exit_geo(
+    trace: ExitTrace,
+    db_record: dict[str, Any] | None,
+    airport: dict[str, Any] | None,
+    max_distance_km: float,
+) -> ExitGeo:
+    """Use DB-IP city only when live Cloudflare routing corroborates it."""
+    record = db_record if isinstance(db_record, dict) else {}
+    country_data = record.get("country")
+    country_data = country_data if isinstance(country_data, dict) else {}
+    db_country = str(country_data.get("iso_code", "")).upper()
+    if db_country not in ISO_COUNTRY_CODES:
+        db_country = ""
+    country_code = trace.country or db_country or None
+    countries_agree = bool(
+        trace.country and db_country and trace.country == db_country
+    )
+
+    names = country_data.get("names")
+    names = names if isinstance(names, dict) else {}
+    suggested_country = (
+        str(names.get("en", "")) if db_country == country_code else ""
+    )
+    country_name = (
+        country_display_name(country_code, suggested_country)
+        if country_code
+        else None
+    )
+
+    city_data = record.get("city")
+    city_data = city_data if isinstance(city_data, dict) else {}
+    city_names = city_data.get("names")
+    city_names = city_names if isinstance(city_names, dict) else {}
+    city = city_display_name(str(city_names.get("en", "")))
+
+    location = record.get("location")
+    location = location if isinstance(location, dict) else {}
+    airport_data = airport if isinstance(airport, dict) else {}
+    airport_country = str(airport_data.get("country", "")).upper()
+    try:
+        distance = _haversine_km(
+            float(location["latitude"]),
+            float(location["longitude"]),
+            float(airport_data["lat"]),
+            float(airport_data["lon"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        distance = math.inf
+
+    city_confident = bool(
+        city
+        and countries_agree
+        and airport_country == country_code
+        and distance <= max_distance_km
+    )
+    return ExitGeo(
+        trace.ip,
+        country_code,
+        country_name,
+        city if city_confident else None,
+        city_confident,
+    )
+
+
+_GEO_LOCK = threading.Lock()
+_GEO_READERS: dict[str, Any] = {}
+_IATA_AIRPORTS: dict[str, dict[str, Any]] | None = None
+_GEO_RESULT_CACHE: dict[tuple[str, str, str, str, float], ExitGeo] = {}
+
+
+def resolve_exit_geo(trace: ExitTrace, settings: Settings) -> ExitGeo:
+    """Resolve locally with cached DB-IP data; never call a quota-limited API."""
+    if trace.ip is None:
+        return ExitGeo(None, trace.country, country_display_name(trace.country) if trace.country else None, None, False)
+
+    db_record: dict[str, Any] | None = None
+    airport: dict[str, Any] | None = None
+    db_path = os.path.abspath(settings.geoip_db_path)
+    cache_key = (
+        db_path,
+        trace.ip,
+        trace.country or "",
+        trace.colo or "",
+        settings.geo_city_max_distance_km,
+    )
+    try:
+        with _GEO_LOCK:
+            cached = _GEO_RESULT_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+            reader = _GEO_READERS.get(db_path)
+            if reader is None and os.path.isfile(db_path):
+                import maxminddb
+
+                reader = maxminddb.open_database(db_path)
+                _GEO_READERS[db_path] = reader
+            global _IATA_AIRPORTS
+            if _IATA_AIRPORTS is None:
+                import airportsdata
+
+                _IATA_AIRPORTS = airportsdata.load("IATA")
+            if reader is not None:
+                found = reader.get(trace.ip)
+                if isinstance(found, dict):
+                    db_record = found
+            if trace.colo:
+                airport = _IATA_AIRPORTS.get(trace.colo)
+    except (ImportError, OSError, ValueError):
+        pass
+    result = corroborate_exit_geo(
+        trace, db_record, airport, settings.geo_city_max_distance_km
+    )
+    with _GEO_LOCK:
+        _GEO_RESULT_CACHE[cache_key] = result
+    return result
 
 
 def summarize_samples(samples: list[ProbeSample]) -> tuple[int, float | None, float | None, float]:
@@ -1372,12 +1591,13 @@ def speed_test_node(
     completed = 0
     stalls = 0
     bytes_downloaded = 0
-    exit_country: str | None = None
+    exit_geo = ExitGeo(None, None, None, None, False)
     try:
         with XraySession(xray_bin, node, settings.xray_start_timeout_seconds) as port:
-            exit_country = detect_exit_country(
+            trace = detect_exit_trace(
                 port, min(6.0, settings.probe_timeout_seconds)
             )
+            exit_geo = resolve_exit_geo(trace, settings)
             transfer_sizes = [settings.speed_test_bytes] if include_quick else []
             if deep_test:
                 transfer_sizes.append(settings.stream_test_bytes)
@@ -1420,7 +1640,11 @@ def speed_test_node(
         quality=quality,
         confirmed_slow=confirmed_slow,
         reason=reason,
-        exit_country=exit_country,
+        exit_country=exit_geo.country_code,
+        exit_ip=exit_geo.ip,
+        exit_country_name=exit_geo.country_name,
+        exit_city=exit_geo.city,
+        geo_city_confident=exit_geo.city_confident,
     )
 
 
@@ -1450,6 +1674,31 @@ def combine_stream_results(
         and reason == "stream_unverified"
     ):
         reason = "stream_multi_endpoint_failed"
+    geo_observations = [
+        item for item in (primary, secondary) if item.exit_ip is not None
+    ]
+    observed_countries = {
+        item.exit_country for item in geo_observations if item.exit_country
+    }
+    confident_cities = {
+        city_display_name(item.exit_city).casefold()
+        for item in geo_observations
+        if item.geo_city_confident and city_display_name(item.exit_city)
+    }
+    all_geo_observations_confident = bool(geo_observations) and all(
+        item.geo_city_confident and city_display_name(item.exit_city)
+        for item in geo_observations
+    )
+    geo_city_confident = bool(
+        all_geo_observations_confident
+        and len(confident_cities) == 1
+        and len(observed_countries) <= 1
+    )
+    agreed_city = (
+        primary.exit_city or secondary.exit_city
+        if geo_city_confident
+        else None
+    )
     return StreamTestResult(
         speed_mbps=float(statistics.median(samples)) if samples else None,
         speed_samples=samples,
@@ -1463,19 +1712,69 @@ def combine_stream_results(
         confirmed_slow=confirmed_slow,
         reason=reason,
         exit_country=primary.exit_country or secondary.exit_country,
+        exit_ip=primary.exit_ip or secondary.exit_ip,
+        exit_country_name=(
+            primary.exit_country_name or secondary.exit_country_name
+        ),
+        exit_city=agreed_city,
+        geo_city_confident=geo_city_confident,
     )
 
 
+def allocate_stable_server_id(
+    fingerprint: str, server_ids: dict[str, int]
+) -> int:
+    """Assign a stable numeric ID; mappings are persisted and never reused."""
+    existing = server_ids.get(fingerprint)
+    if isinstance(existing, int) and SERVER_ID_MIN <= existing <= SERVER_ID_MAX:
+        return existing
+    used = {
+        value
+        for key, value in server_ids.items()
+        if key != fingerprint
+        and isinstance(value, int)
+        and SERVER_ID_MIN <= value <= SERVER_ID_MAX
+    }
+    seed = hashlib.sha256(f"MezaVPN-server-id:{fingerprint}".encode()).digest()
+    four_digit_span = SERVER_ID_FOUR_DIGIT_MAX - SERVER_ID_MIN + 1
+    candidate = SERVER_ID_MIN + int.from_bytes(seed[:8], "big") % four_digit_span
+    for _ in range(four_digit_span):
+        if candidate not in used:
+            server_ids[fingerprint] = candidate
+            return candidate
+        candidate = SERVER_ID_MIN + (
+            (candidate - SERVER_ID_MIN + 1) % four_digit_span
+        )
+
+    five_digit_min = SERVER_ID_FOUR_DIGIT_MAX + 1
+    five_digit_span = SERVER_ID_MAX - five_digit_min + 1
+    candidate = five_digit_min + int.from_bytes(seed[8:16], "big") % five_digit_span
+    for _ in range(five_digit_span):
+        if candidate not in used:
+            server_ids[fingerprint] = candidate
+            return candidate
+        candidate = five_digit_min + (
+            (candidate - five_digit_min + 1) % five_digit_span
+        )
+    raise ScannerError("Stable server ID space is exhausted")
+
+
 def normalize_published_names(
-    records: list[dict[str, Any]], results: dict[str, TestResult]
-) -> tuple[int, int]:
-    counters: collections.Counter[str] = collections.Counter()
+    records: list[dict[str, Any]],
+    results: dict[str, TestResult],
+    server_ids: dict[str, int],
+) -> tuple[int, int, int, int]:
     detected = 0
     unknown = 0
+    city_detected = 0
+    city_omitted = 0
     for record in records:
         fingerprint = str(record.get("fingerprint", ""))
         result = results.get(fingerprint)
         code = result.exit_country if result is not None else None
+        if not code:
+            stored_code = str(record.get("country", "")).upper()
+            code = stored_code if stored_code in ISO_COUNTRY_CODES else None
         if not code:
             code = country_from_name(str(record.get("name", "")))
         if code not in ISO_COUNTRY_CODES:
@@ -1483,8 +1782,33 @@ def normalize_published_names(
             unknown += 1
         else:
             detected += 1
-        counters[code] += 1
-        display_name = f"{flag_for_country(code)} {code} | Server {counters[code]}"
+
+        suggested_country = (
+            result.exit_country_name if result is not None else None
+        ) or str(record.get("country_name", ""))
+        country_name = (
+            country_display_name(code, suggested_country)
+            if code != "UN"
+            else "Unknown"
+        )
+        city: str | None = None
+        if result is not None and result.geo_city_confident and result.exit_city:
+            city = result.exit_city
+        elif result is None or record.get("status") in {"grace", "preserved"}:
+            stored_city = str(record.get("city", "")).strip()
+            if stored_city and record.get("city_confident") is True:
+                city = stored_city
+        if city:
+            city_detected += 1
+        else:
+            city_omitted += 1
+
+        server_id = allocate_stable_server_id(fingerprint, server_ids)
+        display_name = (
+            f"{country_name} · {city} #{server_id}"
+            if city
+            else f"{country_name} #{server_id}"
+        )
         try:
             record["uri"] = set_uri_display_name(str(record["uri"]), display_name)
         except Exception:
@@ -1494,7 +1818,11 @@ def normalize_published_names(
             pass
         record["name"] = display_name
         record["country"] = code
-    return detected, unknown
+        record["country_name"] = country_name
+        record["city"] = city
+        record["city_confident"] = bool(city)
+        record["server_id"] = server_id
+    return detected, unknown, city_detected, city_omitted
 
 
 def quality_for_speed(speed: float | None, settings: Settings) -> str:
@@ -1546,6 +1874,10 @@ def apply_stream_result(
         result.stream_deep_tested = stream.deep_tested
         result.stream_quality = stream.quality
         result.exit_country = stream.exit_country
+        result.exit_ip = stream.exit_ip
+        result.exit_country_name = stream.exit_country_name
+        result.exit_city = stream.exit_city
+        result.geo_city_confident = stream.geo_city_confident
 
     if result.stream_quality in {"strong", "good"}:
         return
@@ -1846,6 +2178,11 @@ def make_record(
         ),
         "stream_history": history,
         "last_deep_test": last_deep_test or None,
+        "exit_ip": result.exit_ip,
+        "country": result.exit_country,
+        "country_name": result.exit_country_name,
+        "city": result.exit_city if result.geo_city_confident else None,
+        "city_confident": result.geo_city_confident,
     }
 
 
@@ -1856,6 +2193,7 @@ def write_outputs(
     status: dict[str, Any],
     suspicious_streak: int,
     settings: Settings,
+    server_ids: dict[str, int],
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     raw = "\n".join(str(record["uri"]) for record in records)
@@ -1869,12 +2207,13 @@ def write_outputs(
     (output_dir / "sub.txt").write_text(primary, encoding="utf-8", newline="\n")
 
     state = {
-        "version": 1,
+        "version": 2,
         "scanner_version": SCANNER_VERSION,
         "generated_at": status["generated_at"],
         "suspicious_streak": suspicious_streak,
         "selected": [record["fingerprint"] for record in records],
         "nodes": all_records,
+        "server_ids": server_ids,
     }
     (output_dir / "state.json").write_text(
         json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1893,7 +2232,9 @@ pre{{white-space:pre-wrap;background:#f4f4f5;padding:18px;border-radius:12px;ove
 a{{display:inline-block;margin-right:14px}}
 </style></head><body><h1>MezaVPN Subscription Status</h1>
 <p><a href="sub.txt">sub.txt</a><a href="sub-raw.txt">sub-raw.txt</a><a href="status.json">status.json</a></p>
-<pre>{status_html}</pre></body></html>"""
+<pre>{status_html}</pre>
+<p><small><a href="https://db-ip.com">IP Geolocation by DB-IP</a></small></p>
+</body></html>"""
     (output_dir / "index.html").write_text(page, encoding="utf-8")
 
     summary_lines = [
@@ -1912,6 +2253,11 @@ a{{display:inline-block;margin-right:14px}}
         f"- Stream stalls rejected: `{status['broken']['stream_stall']}`",
         f"- Independent fallback recoveries: `{status['stream_test']['fallback_recovered']}`",
         f"- Multi-endpoint failures: `{status['broken']['stream_multi_endpoint_failed']}`",
+        f"- Confident exit cities: `{status['naming']['city_confident']}`",
+        f"- City omitted as uncertain: `{status['naming']['city_omitted']}`",
+        f"- Stable server IDs retained: `{status['naming']['stable_ids_registered']}`",
+        f"- Stable server ID range: `{status['naming']['stable_id_range']}` "
+        "(4 digits preferred)",
         f"- Stream-test traffic: `{status['stream_test']['actual_downloaded_bytes'] / 1_048_576:.1f} MiB` "
         f"(cap `{settings.speed_budget_bytes / 1_048_576:.0f} MiB`)",
         f"- Safety mode: `{status['safety_mode']}`",
@@ -1936,6 +2282,32 @@ def run(args: argparse.Namespace) -> int:
     previous_nodes: dict[str, dict[str, Any]] = previous_state.get("nodes", {}) if previous_state else {}
     previous_selected: list[str] = previous_state.get("selected", []) if previous_state else []
     previous_suspicious_streak = int(previous_state.get("suspicious_streak", 0) or 0) if previous_state else 0
+    raw_server_ids = previous_state.get("server_ids", {}) if previous_state else {}
+    server_ids: dict[str, int] = {}
+    used_server_ids: set[int] = set()
+    raw_items = raw_server_ids.items() if isinstance(raw_server_ids, dict) else []
+    for fingerprint, server_id in sorted(raw_items):
+        if (
+            isinstance(server_id, int)
+            and not isinstance(server_id, bool)
+            and SERVER_ID_MIN <= server_id <= SERVER_ID_MAX
+            and server_id not in used_server_ids
+        ):
+            server_ids[str(fingerprint)] = server_id
+            used_server_ids.add(server_id)
+    # Seamless migration if an intermediate state stored IDs only in records.
+    for fingerprint, record in previous_nodes.items():
+        if not isinstance(record, dict) or fingerprint in server_ids:
+            continue
+        old_id = record.get("server_id")
+        if (
+            isinstance(old_id, int)
+            and not isinstance(old_id, bool)
+            and SERVER_ID_MIN <= old_id <= SERVER_ID_MAX
+            and old_id not in used_server_ids
+        ):
+            server_ids[fingerprint] = old_id
+            used_server_ids.add(old_id)
 
     log(f"Downloading {len(source_urls)} subscription source(s)...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(source_urls))) as executor:
@@ -2352,7 +2724,12 @@ def run(args: argparse.Namespace) -> int:
         safety_mode = "accepted_after_repeated_degradation"
         suspicious_streak = 0
 
-    country_detected, country_unknown = normalize_published_names(selected, results)
+    (
+        country_detected,
+        country_unknown,
+        city_detected,
+        city_omitted,
+    ) = normalize_published_names(selected, results, server_ids)
     elite_count = sum(
         1 for record in selected if float(record.get("latency_ms") or 99_999) <= settings.elite_latency_ms
     )
@@ -2485,9 +2862,16 @@ def run(args: argparse.Namespace) -> int:
             "history_scans": settings.stream_history_scans,
         },
         "naming": {
-            "format": "FLAG CC | Server N",
+            "format": "Country · City #StableID (city omitted when uncertain)",
             "country_detected": country_detected,
             "country_unknown": country_unknown,
+            "city_confident": city_detected,
+            "city_omitted": city_omitted,
+            "stable_ids_registered": len(server_ids),
+            "stable_id_range": "1000-99999",
+            "stable_id_policy": "prefer 4 digits; use 5 digits only after 1000-9999 is exhausted",
+            "geoip_mode": "actual egress IP; DB-IP City corroborated by Cloudflare country and colo distance",
+            "geoip_database_available": os.path.isfile(settings.geoip_db_path),
         },
         "safety_mode": safety_mode,
         "duration_seconds": round(time.monotonic() - started, 2),
@@ -2502,6 +2886,7 @@ def run(args: argparse.Namespace) -> int:
         status,
         suspicious_streak,
         settings,
+        server_ids,
     )
     log(f"Published {len(selected)} configs to {output_dir / 'sub.txt'}")
     return 0

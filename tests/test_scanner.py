@@ -1,4 +1,5 @@
 import base64
+import dataclasses
 import json
 import unittest
 from unittest import mock
@@ -152,10 +153,71 @@ class ScannerParserTests(unittest.TestCase):
             set(scanner.COUNTRY_NAME_ALIASES.values()) - scanner.ISO_COUNTRY_CODES
         )
 
+    def test_preferred_country_labels_use_usa_and_uae(self):
+        self.assertEqual(
+            scanner.country_display_name("US", "United States"), "USA"
+        )
+        self.assertEqual(
+            scanner.country_display_name("AE", "United Arab Emirates"), "UAE"
+        )
+        self.assertEqual(scanner.country_display_name("us"), "USA")
+        self.assertEqual(scanner.country_display_name("ae"), "UAE")
+
     def test_exit_country_reads_cloudflare_trace(self):
-        completed = mock.Mock(returncode=0, stdout="fl=1\nip=203.0.113.1\nloc=JP\ntls=TLSv1.3\n")
+        completed = mock.Mock(
+            returncode=0,
+            stdout="fl=1\nip=203.0.113.1\nloc=JP\ncolo=NRT\ntls=TLSv1.3\n",
+        )
         with mock.patch.object(scanner.subprocess, "run", return_value=completed):
             self.assertEqual(scanner.detect_exit_country(19080, 5.0), "JP")
+            trace = scanner.detect_exit_trace(19080, 5.0)
+        self.assertEqual(trace, scanner.ExitTrace("203.0.113.1", "JP", "NRT"))
+
+    def test_geo_city_requires_country_and_distance_corroboration(self):
+        trace = scanner.ExitTrace("203.0.113.8", "DE", "FRA")
+        record = {
+            "country": {"iso_code": "DE", "names": {"en": "Germany"}},
+            "city": {"names": {"en": "Frankfurt"}},
+            "location": {"latitude": 50.1109, "longitude": 8.6821},
+        }
+        airport = {
+            "country": "DE",
+            "lat": 50.0379,
+            "lon": 8.5622,
+        }
+        geo = scanner.corroborate_exit_geo(trace, record, airport, 80.0)
+        self.assertEqual(geo.country_name, "Germany")
+        self.assertEqual(geo.city, "Frankfurt")
+        self.assertTrue(geo.city_confident)
+
+        mismatch = scanner.corroborate_exit_geo(
+            trace,
+            dict(record, country={"iso_code": "NL", "names": {"en": "Netherlands"}}),
+            airport,
+            80.0,
+        )
+        self.assertEqual(mismatch.country_code, "DE")
+        self.assertIsNone(mismatch.city)
+        self.assertFalse(mismatch.city_confident)
+
+    def test_city_display_name_uses_familiar_stable_labels(self):
+        self.assertEqual(scanner.city_display_name("Frankfurt am Main"), "Frankfurt")
+        self.assertEqual(scanner.city_display_name("New York City"), "New York")
+        self.assertIsNone(scanner.city_display_name(""))
+
+    def test_geo_city_is_omitted_when_colo_is_too_far_away(self):
+        geo = scanner.corroborate_exit_geo(
+            scanner.ExitTrace("203.0.113.8", "DE", "FRA"),
+            {
+                "country": {"iso_code": "DE", "names": {"en": "Germany"}},
+                "city": {"names": {"en": "Berlin"}},
+                "location": {"latitude": 52.52, "longitude": 13.405},
+            },
+            {"country": "DE", "lat": 50.0379, "lon": 8.5622},
+            80.0,
+        )
+        self.assertIsNone(geo.city)
+        self.assertFalse(geo.city_confident)
 
     def test_display_name_rewrite_preserves_vless_fingerprint(self):
         uri = f"vless://{UUID}@example.com:443?security=tls&type=tcp#Old"
@@ -191,21 +253,89 @@ class ScannerParserTests(unittest.TestCase):
                 self.assertEqual(after.name, "🇳🇱 NL | Server 1")
                 self.assertEqual(after.fingerprint, before.fingerprint)
 
-    def test_published_names_are_numbered_per_country(self):
+    def test_published_names_use_stable_ids_and_confident_city(self):
         records = [
             {"fingerprint": "a", "name": "🇺🇸 source", "uri": f"vless://{UUID}@a.example:443#x"},
             {"fingerprint": "b", "name": "United States node", "uri": f"vless://{UUID}@b.example:443#x"},
             {"fingerprint": "c", "name": "Canada", "uri": f"vless://{UUID}@c.example:443#x"},
             {"fingerprint": "d", "name": "mystery", "uri": f"vless://{UUID}@d.example:443#x"},
         ]
-        detected, unknown = scanner.normalize_published_names(records, {})
-        self.assertEqual((detected, unknown), (3, 1))
+        results = {
+            "a": scanner.TestResult(
+                "a", True, 3, 3, 100, 10, 1.0, "ok",
+                exit_country="US", exit_country_name="USA",
+                exit_city="New York", geo_city_confident=True,
+            )
+        }
+        registry = {}
+        counts = scanner.normalize_published_names(records, results, registry)
+        self.assertEqual(counts, (3, 1, 1, 3))
+        self.assertRegex(records[0]["name"], r"^USA · New York #\d{4,5}$")
+        self.assertRegex(records[1]["name"], r"^USA #\d{4,5}$")
+        self.assertRegex(records[2]["name"], r"^Canada #\d{4,5}$")
+        self.assertRegex(records[3]["name"], r"^Unknown #\d{4,5}$")
+        self.assertEqual(len(set(registry.values())), 4)
+
+        original_ids = dict(registry)
+        returning = [
+            {"fingerprint": "c", "name": "Canada", "uri": f"vless://{UUID}@c.example:443#x"},
+            {"fingerprint": "a", "name": "US", "uri": f"vless://{UUID}@a.example:443#x"},
+        ]
+        scanner.normalize_published_names(returning, results, registry)
         self.assertEqual(
-            [record["name"] for record in records],
-            [
-                "🇺🇸 US | Server 1", "🇺🇸 US | Server 2",
-                "🇨🇦 CA | Server 1", "🌐 UN | Server 1",
-            ],
+            [record["server_id"] for record in returning],
+            [original_ids["c"], original_ids["a"]],
+        )
+
+    def test_stable_id_collision_never_reuses_an_existing_number(self):
+        registry = {"old": 1042}
+        with mock.patch.object(scanner.hashlib, "sha256") as digest:
+            digest.return_value.digest.return_value = (
+                (1042 - scanner.SERVER_ID_MIN).to_bytes(8, "big") + b"x" * 24
+            )
+            allocated = scanner.allocate_stable_server_id("new", registry)
+        self.assertNotEqual(allocated, 1042)
+        self.assertEqual(registry["old"], 1042)
+
+    def test_stable_ids_prefer_four_digits_and_never_exceed_five(self):
+        registry = {}
+        for index in range(500):
+            allocated = scanner.allocate_stable_server_id(
+                f"fingerprint-{index}", registry
+            )
+            self.assertGreaterEqual(allocated, 1000)
+            self.assertLessEqual(allocated, 9999)
+            self.assertLessEqual(len(str(allocated)), 5)
+        self.assertEqual(len(set(registry.values())), 500)
+
+    def test_stable_id_uses_five_digits_only_when_four_digit_space_is_full(self):
+        registry = {
+            f"occupied-{server_id}": server_id
+            for server_id in range(
+                scanner.SERVER_ID_MIN,
+                scanner.SERVER_ID_FOUR_DIGIT_MAX + 1,
+            )
+        }
+        allocated = scanner.allocate_stable_server_id("new", registry)
+        self.assertGreaterEqual(allocated, 10000)
+        self.assertLessEqual(allocated, 99999)
+
+    def test_existing_four_or_five_digit_id_is_preserved(self):
+        for existing in (1042, 42081):
+            with self.subTest(existing=existing):
+                registry = {"same": existing}
+                self.assertEqual(
+                    scanner.allocate_stable_server_id("same", registry), existing
+                )
+
+    def test_legacy_six_digit_id_is_replaced_once(self):
+        registry = {"same": 602881}
+        replacement = scanner.allocate_stable_server_id("same", registry)
+        self.assertGreaterEqual(replacement, 1000)
+        self.assertLessEqual(replacement, 9999)
+        self.assertEqual(registry["same"], replacement)
+        self.assertEqual(
+            scanner.allocate_stable_server_id("same", registry), replacement
         )
 
     def test_settings_defaults(self):
@@ -219,6 +349,7 @@ class ScannerParserTests(unittest.TestCase):
         self.assertEqual(settings.strong_speed_mbps, 2.5)
         self.assertEqual(settings.speed_budget_bytes, 96 * 1024 * 1024)
         self.assertEqual(settings.speed_retry_reserve_bytes, 12 * 1024 * 1024)
+        self.assertEqual(settings.geo_city_max_distance_km, 80.0)
         self.assertEqual(
             settings.speed_retry_url, "https://proof.ovh.net/files/1Mb.dat"
         )
@@ -440,6 +571,39 @@ class ScannerParserTests(unittest.TestCase):
         self.assertEqual(combined.quality, "good")
         self.assertEqual(combined.reason, "ok")
         self.assertEqual(combined.exit_country, "DE")
+
+    def test_combined_geo_omits_disagreeing_cities(self):
+        settings = scanner.Settings()
+        primary = scanner.StreamTestResult(
+            3.0, [3.0], 3.0, 1, 1, 0, 262144, False,
+            "strong", False, "ok", "DE", "203.0.113.1",
+            "Germany", "Frankfurt", True,
+        )
+        secondary = scanner.StreamTestResult(
+            3.1, [3.1], 3.1, 1, 1, 0, 1048576, True,
+            "strong", False, "ok", "DE", "203.0.113.2",
+            "Germany", "Berlin", True,
+        )
+        combined = scanner.combine_stream_results(primary, secondary, settings)
+        self.assertIsNone(combined.exit_city)
+        self.assertFalse(combined.geo_city_confident)
+
+    def test_combined_geo_keeps_two_matching_confident_cities(self):
+        settings = scanner.Settings()
+        primary = scanner.StreamTestResult(
+            3.0, [3.0], 3.0, 1, 1, 0, 262144, False,
+            "strong", False, "ok", "DE", "203.0.113.1",
+            "Germany", "Frankfurt", True,
+        )
+        secondary = dataclasses.replace(
+            primary,
+            speed_mbps=3.1,
+            speed_samples=[3.1],
+            exit_ip="203.0.113.2",
+        )
+        combined = scanner.combine_stream_results(primary, secondary, settings)
+        self.assertEqual(combined.exit_city, "Frankfurt")
+        self.assertTrue(combined.geo_city_confident)
 
     def test_two_independent_failures_are_hard_rejection(self):
         settings = scanner.Settings()

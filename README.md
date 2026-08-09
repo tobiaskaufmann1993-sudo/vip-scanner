@@ -1,5 +1,5 @@
+# اسکنر رایگان کانفیگ‌های MezaVPN روی GitHub Actions
 
-<<<<<<< HEAD
 این پروژه چند لینک Subscription استاندارد V2Ray را هر ۳۰ دقیقه دریافت می‌کند، کانفیگ‌های تکراری را **پیش از اسکن** حذف می‌کند، هر کانفیگ را واقعاً با **Xray-core** اجرا می‌کند و فقط گزینه‌های سالم و باکیفیت را در یک لینک ثابت GitHub Pages منتشر می‌کند.
 
 ## خروجی‌ها
@@ -27,6 +27,10 @@ Finland #1274
 ```
 
 شهر فقط وقتی نمایش داده می‌شود که شواهد مستقل با هم سازگار باشند؛ نمایش‌ندادن شهر به نمایش شهر مشکوک ترجیح داده می‌شود. شماره بعد از `#` شناسه پایدار همان Fingerprint است، شماره ترتیب لیست نیست. شناسه‌ها ابتدا از بازه چهاره‌رقمی `1000–9999` انتخاب می‌شوند و فقط پس از پرشدن کامل این بازه به بازه پنج‌رقمی می‌روند؛ هیچ شناسه‌ای بیشتر از پنج رقم نیست.
+
+نام کشور از فهرست استاندارد و کوتاه محصول ساخته می‌شود (برای نمونه `Netherlands`، نه `The Netherlands`). توضیحات منطقه‌ای، borough، district و متن داخل پرانتز از نام شهر حذف می‌شوند؛ نام مشکوک، عدددار یا بیش‌ازحد بلند به‌جای کوتاه‌سازی حدسی اصلاً نمایش داده نمی‌شود.
+
+اگر نام شهر و کشور یکسان باشد، نام شهر به‌عنوان تکرار اضافی حذف می‌شود؛ برای نمونه خروجی `Singapore #4622` است، نه `Singapore · Singapore #4622`.
 
 ## اسکن دقیقاً چه کاری انجام می‌دهد؟
 
@@ -249,6 +253,9 @@ https://USERNAME.github.io/REPOSITORY/status.json
   },
   "naming": {
     "format": "Country · City #StableID (city omitted when uncertain)",
+    "country_label_policy": "canonical short product label; never raw GeoIP wording",
+    "city_label_policy": "city only; administrative qualifiers removed; suspicious labels omitted",
+    "city_label_max_characters": 28,
     "country_detected": 48,
     "country_unknown": 2,
     "city_confident": 31,
@@ -453,5 +460,3 @@ XRAY_VERSION: "v26.3.27"
 ```
 
 این کار مانع تغییر ناگهانی رفتار اسکنر با انتشار نسخه جدید می‌شود. نسخه را فقط پس از بررسی Release رسمی و اجرای موفق تست‌ها تغییر بده.
-=======
->>>>>>> 1b1b15a507d53baf4a08c3c59d23805386a3cf49

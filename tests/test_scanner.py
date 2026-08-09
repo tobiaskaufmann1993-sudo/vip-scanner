@@ -152,6 +152,14 @@ class ScannerParserTests(unittest.TestCase):
         self.assertFalse(
             set(scanner.COUNTRY_NAME_ALIASES.values()) - scanner.ISO_COUNTRY_CODES
         )
+        for code in scanner.ISO_COUNTRY_CODES:
+            with self.subTest(code=code):
+                label = scanner.country_display_name(
+                    code, "The Untrusted Provider Country Label"
+                )
+                self.assertNotEqual(label, code)
+                self.assertFalse(label.casefold().startswith("the "))
+                self.assertNotIn("(", label)
 
     def test_preferred_country_labels_use_usa_and_uae(self):
         self.assertEqual(
@@ -162,6 +170,9 @@ class ScannerParserTests(unittest.TestCase):
         )
         self.assertEqual(scanner.country_display_name("us"), "USA")
         self.assertEqual(scanner.country_display_name("ae"), "UAE")
+        self.assertEqual(
+            scanner.country_display_name("NL", "The Netherlands"), "Netherlands"
+        )
 
     def test_exit_country_reads_cloudflare_trace(self):
         completed = mock.Mock(
@@ -203,7 +214,92 @@ class ScannerParserTests(unittest.TestCase):
     def test_city_display_name_uses_familiar_stable_labels(self):
         self.assertEqual(scanner.city_display_name("Frankfurt am Main"), "Frankfurt")
         self.assertEqual(scanner.city_display_name("New York City"), "New York")
+        self.assertEqual(
+            scanner.city_display_name("Amsterdam (Amsterdam-Zuidoost)", "NL"),
+            "Amsterdam",
+        )
+        self.assertEqual(
+            scanner.city_display_name("Paris (7th Arrondissement)", "FR"),
+            "Paris",
+        )
+        self.assertEqual(
+            scanner.city_display_name(
+                "Frankfurt am Main (Innenstadt I)", "DE"
+            ),
+            "Frankfurt",
+        )
+        self.assertEqual(
+            scanner.city_display_name(
+                "Los Angeles (Downtown Los Angeles)", "US"
+            ),
+            "Los Angeles",
+        )
+        self.assertEqual(
+            scanner.city_display_name("Singapore (Pioneer)", "SG"),
+            "Singapore",
+        )
+        self.assertEqual(scanner.city_display_name("Shibuya City", "JP"), "Tokyo")
+        self.assertEqual(scanner.city_display_name("Chiyoda", "JP"), "Tokyo")
+        self.assertIsNone(scanner.city_display_name("District 7", "XX"))
+        self.assertIsNone(
+            scanner.city_display_name("An Implausibly Long Administrative Place Name")
+        )
         self.assertIsNone(scanner.city_display_name(""))
+
+    def test_preserved_names_are_resanitized_before_publication(self):
+        uri = f"vless://{UUID}@nl.example:443#Old"
+        parsed = scanner.parse_node(uri)
+        records = [
+            {
+                "fingerprint": parsed.fingerprint,
+                "name": "The Netherlands source",
+                "uri": uri,
+                "country": "NL",
+                "country_name": "The Netherlands",
+                "city": "Amsterdam (Amsterdam-Zuidoost)",
+                "city_confident": True,
+                "status": "preserved",
+            }
+        ]
+        scanner.normalize_published_names(records, {}, {})
+        self.assertRegex(
+            records[0]["name"], r"^Netherlands · Amsterdam #\d{4,5}$"
+        )
+        self.assertEqual(scanner.parse_node(records[0]["uri"]).name, records[0]["name"])
+
+    def test_city_equal_to_country_is_omitted_from_published_name(self):
+        uri = f"vless://{UUID}@sg.example:443#Old"
+        parsed = scanner.parse_node(uri)
+        records = [
+            {"fingerprint": parsed.fingerprint, "name": "Singapore", "uri": uri}
+        ]
+        results = {
+            parsed.fingerprint: scanner.TestResult(
+                parsed.fingerprint,
+                True,
+                3,
+                3,
+                100,
+                10,
+                1.0,
+                "ok",
+                exit_country="SG",
+                exit_country_name="Singapore",
+                exit_city="Singapore",
+                geo_city_confident=True,
+            )
+        }
+        counts = scanner.normalize_published_names(records, results, {})
+        self.assertEqual(counts, (1, 0, 0, 1))
+        self.assertRegex(records[0]["name"], r"^Singapore #\d{4,5}$")
+        self.assertNotIn("Singapore · Singapore", records[0]["name"])
+
+    def test_equivalent_macau_spelling_is_recognized_as_duplicate(self):
+        self.assertEqual(scanner.city_display_name("Macao", "MO"), "Macau")
+        self.assertEqual(
+            scanner.location_label_key("Macau"),
+            scanner.location_label_key(scanner.city_display_name("Macao", "MO")),
+        )
 
     def test_geo_city_is_omitted_when_colo_is_too_far_away(self):
         geo = scanner.corroborate_exit_geo(

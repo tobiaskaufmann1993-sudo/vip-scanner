@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 SUPPORTED_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://")
-SCANNER_VERSION = "1.3.2"
+SCANNER_VERSION = "1.3.4"
 UTC = dt.timezone.utc
 SERVER_ID_MIN = 1000
 SERVER_ID_FOUR_DIGIT_MAX = 9999
@@ -480,6 +480,54 @@ COUNTRY_NAME_ALIASES = {
 # XK is widely returned for Kosovo by IP geolocation providers even though it
 # is a user-assigned rather than officially allocated ISO 3166-1 code.
 ISO_COUNTRY_CODES = frozenset((*ISO_COUNTRY_CODES, "XK"))
+
+# Short, product-facing labels. GeoIP provider wording is deliberately not used
+# verbatim because it may contain articles or formal political names that are
+# unsuitable for a compact VPN server list.
+COUNTRY_DISPLAY_OVERRIDES = {
+    "AE": "UAE",
+    "BA": "Bosnia & Herzegovina",
+    "CD": "DR Congo",
+    "CG": "Congo",
+    "CZ": "Czechia",
+    "GB": "United Kingdom",
+    "KR": "South Korea",
+    "MO": "Macau",
+    "NL": "Netherlands",
+    "RU": "Russia",
+    "US": "USA",
+    "BL": "Saint Barthelemy",
+    "BV": "Bouvet Island",
+    "CC": "Cocos Islands",
+    "CK": "Cook Islands",
+    "CX": "Christmas Island",
+    "EH": "Western Sahara",
+    "FK": "Falkland Islands",
+    "GS": "South Georgia Islands",
+    "HM": "Heard & McDonald Islands",
+    "IO": "British Indian Ocean",
+    "MS": "Montserrat",
+    "NF": "Norfolk Island",
+    "NU": "Niue",
+    "PM": "Saint Pierre & Miquelon",
+    "PN": "Pitcairn Islands",
+    "SH": "Saint Helena",
+    "SJ": "Svalbard & Jan Mayen",
+    "TF": "French Southern Lands",
+    "TK": "Tokelau",
+    "UM": "US Outlying Islands",
+    "WF": "Wallis & Futuna",
+}
+
+TOKYO_SPECIAL_WARDS = frozenset(
+    {
+        "adachi", "arakawa", "bunkyo", "chiyoda", "chuo", "edogawa",
+        "itabashi", "katsushika", "kita", "koto", "meguro", "minato",
+        "nakano", "nerima", "ota", "setagaya", "shibuya", "shinagawa",
+        "shinjuku", "suginami", "sumida", "taito", "toshima",
+    }
+)
+MAX_CITY_DISPLAY_LENGTH = 28
 
 
 def flag_for_country(code: str) -> str:
@@ -1227,31 +1275,83 @@ def detect_exit_country(socks_port: int, timeout: float) -> str | None:
 def country_display_name(code: str | None, suggested: str | None = None) -> str:
     """Return a short English country label suitable for a VPN server list."""
     normalized_code = (code or "").upper()
-    preferred_labels = {
-        "US": "USA",
-        "AE": "UAE",
-    }
-    if normalized_code in preferred_labels:
-        return preferred_labels[normalized_code]
-    clean_suggested = re.sub(r"[·#\r\n]+", " ", suggested or "").strip()
-    if clean_suggested and len(clean_suggested) <= 48:
-        return clean_suggested
+    if normalized_code in COUNTRY_DISPLAY_OVERRIDES:
+        return COUNTRY_DISPLAY_OVERRIDES[normalized_code]
     for alias, alias_code in COUNTRY_NAME_ALIASES.items():
         if alias_code == normalized_code:
-            return alias.title()
+            words = alias.split()
+            return " ".join(
+                word.lower() if index and word in {"and", "of", "the"} else word.title()
+                for index, word in enumerate(words)
+            )
     return normalized_code or "Unknown"
 
 
-def city_display_name(value: str | None) -> str | None:
-    clean = re.sub(r"[·#\r\n]+", " ", value or "").strip()[:64]
+def city_display_name(
+    value: str | None, country_code: str | None = None
+) -> str | None:
+    """Return only a compact city, never a district or provider annotation."""
+    clean = html.unescape(urllib.parse.unquote(value or ""))
+    clean = unicodedata.normalize("NFKC", clean)
+    clean = re.sub(r"[·#|/@:_\r\n]+", " ", clean)
+    # GeoIP datasets sometimes append boroughs/districts in parentheses. They
+    # are administrative detail, not part of the product-facing city name.
+    previous = None
+    while clean != previous:
+        previous = clean
+        clean = re.sub(r"\s*[\(\[\{][^\)\]\}]*[\)\]\}]\s*", " ", clean)
+    clean = re.split(r"\s*[;,]\s*", clean, maxsplit=1)[0]
+    clean = re.sub(r"^city\s+of\s+", "", clean, flags=re.IGNORECASE)
+    clean = re.sub(
+        r"\s+(?:(?:\d+)(?:st|nd|rd|th)?\s+)?"
+        r"(?:arrondissement|district|borough|county|municipality|province|"
+        r"prefecture|region|subdivision|ward)$",
+        "",
+        clean,
+        flags=re.IGNORECASE,
+    )
+    clean = re.sub(r"\s+", " ", clean).strip(" .-'’")
     if not clean:
         return None
     aliases = {
         "frankfurt am main": "Frankfurt",
+        "macao": "Macau",
         "new york city": "New York",
         "washington, d.c.": "Washington DC",
     }
-    return aliases.get(clean.casefold(), clean)
+    folded = clean.casefold()
+    normalized_country = (country_code or "").upper()
+    if normalized_country == "JP":
+        ward = re.sub(r"\s+(?:city|ku)$", "", folded).strip()
+        if ward in TOKYO_SPECIAL_WARDS:
+            return "Tokyo"
+    if normalized_country == "NL" and folded.startswith("amsterdam-"):
+        return "Amsterdam"
+    clean = aliases.get(folded, clean)
+    folded = clean.casefold()
+    forbidden_words = {
+        "arrondissement", "borough", "county", "district", "downtown",
+        "municipality", "prefecture", "province", "region", "subdivision",
+        "ward",
+    }
+    if any(word in forbidden_words for word in re.findall(r"[a-z]+", folded)):
+        return None
+    if any(char.isdigit() for char in clean):
+        return None
+    if any(
+        not (char.isalpha() or char.isspace() or char in "-'’.")
+        for char in clean
+    ):
+        return None
+    if len(clean) > MAX_CITY_DISPLAY_LENGTH or len(clean.split()) > 4:
+        return None
+    return clean
+
+
+def location_label_key(value: str | None) -> str:
+    """Normalize a location label solely for safe duplicate comparison."""
+    normalized = unicodedata.normalize("NFKD", value or "").casefold()
+    return "".join(char for char in normalized if char.isalnum())
 
 
 def _haversine_km(
@@ -1301,7 +1401,7 @@ def corroborate_exit_geo(
     city_data = city_data if isinstance(city_data, dict) else {}
     city_names = city_data.get("names")
     city_names = city_names if isinstance(city_names, dict) else {}
-    city = city_display_name(str(city_names.get("en", "")))
+    city = city_display_name(str(city_names.get("en", "")), country_code)
 
     location = record.get("location")
     location = location if isinstance(location, dict) else {}
@@ -1681,12 +1781,14 @@ def combine_stream_results(
         item.exit_country for item in geo_observations if item.exit_country
     }
     confident_cities = {
-        city_display_name(item.exit_city).casefold()
+        city_display_name(item.exit_city, item.exit_country).casefold()
         for item in geo_observations
-        if item.geo_city_confident and city_display_name(item.exit_city)
+        if item.geo_city_confident
+        and city_display_name(item.exit_city, item.exit_country)
     }
     all_geo_observations_confident = bool(geo_observations) and all(
-        item.geo_city_confident and city_display_name(item.exit_city)
+        item.geo_city_confident
+        and city_display_name(item.exit_city, item.exit_country)
         for item in geo_observations
     )
     geo_city_confident = bool(
@@ -1798,6 +1900,11 @@ def normalize_published_names(
             stored_city = str(record.get("city", "")).strip()
             if stored_city and record.get("city_confident") is True:
                 city = stored_city
+        city = city_display_name(city, code)
+        # City-states and same-named capitals otherwise produce labels such as
+        # "Singapore · Singapore". The second copy adds no useful information.
+        if city and location_label_key(city) == location_label_key(country_name):
+            city = None
         if city:
             city_detected += 1
         else:
@@ -2863,6 +2970,9 @@ def run(args: argparse.Namespace) -> int:
         },
         "naming": {
             "format": "Country · City #StableID (city omitted when uncertain)",
+            "country_label_policy": "canonical short product label; never raw GeoIP wording",
+            "city_label_policy": "city only; administrative qualifiers removed; suspicious labels omitted",
+            "city_label_max_characters": MAX_CITY_DISPLAY_LENGTH,
             "country_detected": country_detected,
             "country_unknown": country_unknown,
             "city_confident": city_detected,

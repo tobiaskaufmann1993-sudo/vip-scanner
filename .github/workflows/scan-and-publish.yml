@@ -18,7 +18,9 @@ concurrency:
 env:
   XRAY_VERSION: "v26.3.27"
   # Public feeds can be tracked here; private feeds remain in the SUB_URLS secret.
-  ADDITIONAL_SUB_URLS: "https://raw.githubusercontent.com/MahsaNetConfigTopic/config/refs/heads/main/xray_final.txt"
+  ADDITIONAL_SUB_URLS: |
+    https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt
+    https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS_mobile.txt
   # Broad health filter only; the client performs final regional selection.
   ELITE_LATENCY_MS: "800"
   MAX_LATENCY_MS: "3000"
@@ -46,8 +48,13 @@ env:
   MAX_SCAN_SECONDS: "2220"
   OUTPUT_FORMAT: "base64"
   GEOIP_DB_PATH: ".cache/geoip/dbip-city-lite.mmdb"
-  # City is published only when DB-IP and the live Cloudflare route agree.
+  GEONAMES_CITIES_PATH: ".cache/geoip/cities15000.txt"
+  # GeoIP city requires DB-IP/Cloudflare agreement; a matching source-name
+  # Country, City hint may conservatively fill a missing GeoIP city.
   GEO_CITY_MAX_DISTANCE_KM: "80"
+  # Additive GeoIP recovery: infer only a missing DB-IP city from a nearby
+  # significant GeoNames place; an existing DB-IP city is never replaced.
+  GEONAMES_NEAREST_CITY_KM: "25"
 
 jobs:
   freshness:
@@ -130,14 +137,16 @@ jobs:
           fi
           echo "month=$month" >> "$GITHUB_OUTPUT"
 
-      - name: Restore cached DB-IP City database
+      - name: Restore cached local city databases
         id: geoip_cache
         uses: actions/cache@v5
         with:
-          path: .cache/geoip/dbip-city-lite.mmdb
-          key: dbip-city-lite-${{ steps.geoip_release.outputs.month }}
+          path: |
+            .cache/geoip/dbip-city-lite.mmdb
+            .cache/geoip/cities15000.txt
+          key: geo-city-data-${{ steps.geoip_release.outputs.month }}-v1
 
-      - name: Download monthly DB-IP City database
+      - name: Download local DB-IP and GeoNames city data
         if: steps.geoip_cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
@@ -150,10 +159,16 @@ jobs:
           gzip --test /tmp/dbip-city-lite.mmdb.gz
           gzip --decompress --stdout /tmp/dbip-city-lite.mmdb.gz \
             > "$GEOIP_DB_PATH"
+          curl --fail --location --retry 3 --retry-delay 3 \
+            --output /tmp/cities15000.zip \
+            "https://download.geonames.org/export/dump/cities15000.zip"
+          unzip -p /tmp/cities15000.zip cities15000.txt \
+            > "$GEONAMES_CITIES_PATH"
 
-      - name: Validate local GeoIP database
+      - name: Validate local city databases
         run: |
           python -c 'import maxminddb, os; p=os.environ["GEOIP_DB_PATH"]; r=maxminddb.open_database(p); assert r.metadata().ip_version in (4, 6); r.close(); print(f"DB-IP ready: {os.path.getsize(p) / 1048576:.1f} MiB")'
+          python -c 'import os; p=os.environ["GEONAMES_CITIES_PATH"]; lines=sum(1 for _ in open(p, encoding="utf-8")); assert lines > 20000; print(f"GeoNames ready: {lines} cities, {os.path.getsize(p) / 1048576:.1f} MiB")'
 
       - name: Run parser tests
         run: python -m unittest discover -s tests -v

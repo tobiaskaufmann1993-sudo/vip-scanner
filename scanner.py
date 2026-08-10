@@ -42,8 +42,17 @@ from pathlib import Path
 from typing import Any, Iterable
 
 SUPPORTED_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://")
-SCANNER_VERSION = "1.3.4"
+SCANNER_VERSION = "1.5.0"
 UTC = dt.timezone.utc
+EXIT_IP_FALLBACK_URLS = (
+    "https://api64.ipify.org",
+    "https://checkip.amazonaws.com/",
+)
+RETIRED_SOURCE_URLS = frozenset(
+    {
+        "https://raw.githubusercontent.com/MahsaNetConfigTopic/config/refs/heads/main/xray_final.txt",
+    }
+)
 SERVER_ID_MIN = 1000
 SERVER_ID_FOUR_DIGIT_MAX = 9999
 SERVER_ID_MAX = 99999
@@ -103,6 +112,8 @@ class Settings:
     output_format: str = "base64"
     geoip_db_path: str = ".cache/geoip/dbip-city-lite.mmdb"
     geo_city_max_distance_km: float = 80.0
+    geonames_cities_path: str = ".cache/geoip/cities15000.txt"
+    geonames_nearest_city_km: float = 25.0
     speed_test_url: str = "https://speed.cloudflare.com/__down?bytes={bytes}"
     speed_retry_url: str = "https://proof.ovh.net/files/1Mb.dat"
     probe_urls: tuple[str, ...] = (
@@ -183,6 +194,13 @@ class Settings:
             geo_city_max_distance_km=env_float(
                 "GEO_CITY_MAX_DISTANCE_KM", defaults.geo_city_max_distance_km
             ),
+            geonames_cities_path=os.getenv(
+                "GEONAMES_CITIES_PATH", defaults.geonames_cities_path
+            ).strip(),
+            geonames_nearest_city_km=env_float(
+                "GEONAMES_NEAREST_CITY_KM",
+                defaults.geonames_nearest_city_km,
+            ),
             speed_test_url=os.getenv("SPEED_TEST_URL", defaults.speed_test_url).strip(),
             speed_retry_url=os.getenv(
                 "SPEED_RETRY_URL", defaults.speed_retry_url
@@ -241,6 +259,10 @@ class Settings:
             raise ScannerError("STREAM_HISTORY_SCANS must be between 3 and 12")
         if not 10 <= self.geo_city_max_distance_km <= 250:
             raise ScannerError("GEO_CITY_MAX_DISTANCE_KM must be between 10 and 250")
+        if not 5 <= self.geonames_nearest_city_km <= 40:
+            raise ScannerError(
+                "GEONAMES_NEAREST_CITY_KM must be between 5 and 40"
+            )
 
 
 @dataclasses.dataclass(slots=True)
@@ -253,6 +275,7 @@ class Node:
     host: str
     port: int
     source_ids: set[str] = dataclasses.field(default_factory=set)
+    source_names: set[str] = dataclasses.field(default_factory=set)
 
 
 @dataclasses.dataclass(slots=True)
@@ -289,6 +312,7 @@ class TestResult:
     exit_country_name: str | None = None
     exit_city: str | None = None
     geo_city_confident: bool = False
+    exit_city_source: str | None = None
 
 
 @dataclasses.dataclass(slots=True)
@@ -309,6 +333,7 @@ class StreamTestResult:
     exit_country_name: str | None = None
     exit_city: str | None = None
     geo_city_confident: bool = False
+    exit_city_source: str | None = None
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -325,6 +350,17 @@ class ExitGeo:
     country_name: str | None
     city: str | None
     city_confident: bool
+    city_source: str | None = None
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class GeoCity:
+    name: str
+    country_code: str
+    latitude: float
+    longitude: float
+    population: int = 0
+    feature_code: str = "PPL"
 
 
 @dataclasses.dataclass(slots=True)
@@ -615,6 +651,8 @@ def configured_source_urls() -> list[str]:
         if not raw.strip():
             continue
         for url in extract_source_urls(raw):
+            if url in RETIRED_SOURCE_URLS:
+                continue
             if url not in seen:
                 seen.add(url)
                 urls.append(url)
@@ -699,7 +737,7 @@ def make_tls_settings(
     server_host: str,
 ) -> tuple[str, dict[str, Any]]:
     security = (security or "none").lower()
-    if security in {"", "none"}:
+    if security in {"", "none", "false", "0", "off"}:
         return "none", {}
 
     server_name = qfirst(query, "sni", "serverName", default=server_host)
@@ -1225,14 +1263,15 @@ def probe_once(port: int, url: str, settings: Settings) -> ProbeSample:
     )
 
 
-def detect_exit_trace(socks_port: int, timeout: float) -> ExitTrace:
-    """Return the actual proxy egress IP, country and Cloudflare colo."""
+def _fetch_small_text_through_proxy(
+    socks_port: int, timeout: float, url: str
+) -> str:
     command = [
         "curl", "--silent", "--show-error", "--fail", "--http1.1",
         "--proxy", f"socks5h://127.0.0.1:{socks_port}",
         "--connect-timeout", str(min(4.0, timeout)), "--max-time", str(timeout),
         "--user-agent", "MezaVPN-Quality-Scanner/1.0",
-        "https://www.cloudflare.com/cdn-cgi/trace",
+        url,
     ]
     try:
         completed = subprocess.run(
@@ -1244,14 +1283,24 @@ def detect_exit_trace(socks_port: int, timeout: float) -> ExitTrace:
             text=True,
         )
     except subprocess.TimeoutExpired:
-        return ExitTrace(None, None, None)
+        return ""
     if completed.returncode != 0:
-        return ExitTrace(None, None, None)
+        return ""
+    return completed.stdout.strip()[:8192]
+
+
+def detect_exit_trace(socks_port: int, timeout: float) -> ExitTrace:
+    """Return the actual proxy egress IP, country and Cloudflare colo."""
+    trace_text = _fetch_small_text_through_proxy(
+        socks_port,
+        timeout,
+        "https://www.cloudflare.com/cdn-cgi/trace",
+    )
     fields = {
         key.strip(): value.strip()
         for key, value in (
             line.split("=", 1)
-            for line in completed.stdout.splitlines()
+            for line in trace_text.splitlines()
             if "=" in line
         )
     }
@@ -1264,6 +1313,22 @@ def detect_exit_trace(socks_port: int, timeout: float) -> ExitTrace:
     country = raw_country if raw_country in ISO_COUNTRY_CODES else None
     raw_colo = fields.get("colo", "").upper()
     colo = raw_colo if re.fullmatch(r"[A-Z0-9]{3}", raw_colo) else None
+    if exit_ip is not None:
+        return ExitTrace(exit_ip, country, colo)
+
+    # If Cloudflare trace is blocked by a working proxy, ask an independent
+    # service only for the caller IP. Country/city still come from our local
+    # database, so this adds no per-IP geolocation API dependency.
+    fallback_timeout = min(4.0, timeout)
+    for url in EXIT_IP_FALLBACK_URLS:
+        raw_fallback = _fetch_small_text_through_proxy(
+            socks_port, fallback_timeout, url
+        )
+        try:
+            fallback_ip = str(ipaddress.ip_address(raw_fallback.strip()))
+        except ValueError:
+            continue
+        return ExitTrace(fallback_ip, None, None)
     return ExitTrace(exit_ip, country, colo)
 
 
@@ -1354,6 +1419,52 @@ def location_label_key(value: str | None) -> str:
     return "".join(char for char in normalized if char.isalnum())
 
 
+def source_city_from_name(
+    source_name: str | None, expected_country: str | None
+) -> str | None:
+    """Extract a conservative ``Country, City | tag`` subscription hint."""
+    expected = (expected_country or "").upper()
+    if expected not in ISO_COUNTRY_CODES:
+        return None
+    value = html.unescape(urllib.parse.unquote(source_name or ""))
+    location_part = value.split("|", 1)[0].strip()
+    if "," not in location_part:
+        return None
+    country_part, city_part = location_part.split(",", 1)
+    source_country = country_from_name(country_part)
+    if source_country != expected:
+        return None
+    city = city_display_name(city_part, source_country)
+    if not city:
+        return None
+    if location_label_key(city) == location_label_key(
+        country_display_name(source_country)
+    ):
+        return None
+    return city
+
+
+def source_city_from_record(
+    record: dict[str, Any], expected_country: str | None
+) -> str | None:
+    """Use a source-name city only when all usable duplicate labels agree."""
+    raw_names = record.get("source_names", [])
+    names = (
+        [str(item) for item in raw_names]
+        if isinstance(raw_names, (list, tuple, set))
+        else []
+    )
+    current_name = str(record.get("name", ""))
+    if current_name:
+        names.append(current_name)
+    candidates: dict[str, str] = {}
+    for name in names:
+        city = source_city_from_name(name, expected_country)
+        if city:
+            candidates.setdefault(location_label_key(city), city)
+    return next(iter(candidates.values())) if len(candidates) == 1 else None
+
+
 def _haversine_km(
     first_lat: float, first_lon: float, second_lat: float, second_lon: float
 ) -> float:
@@ -1368,11 +1479,131 @@ def _haversine_km(
     return radius_km * 2.0 * math.asin(min(1.0, math.sqrt(value)))
 
 
+_GEONAMES_LOCK = threading.Lock()
+_GEONAMES_DATASETS: dict[str, dict[str, tuple[GeoCity, ...]]] = {}
+GEONAMES_CITY_FEATURE_CODES = frozenset(
+    {"PPL", "PPLA", "PPLA2", "PPLA3", "PPLA4", "PPLA5", "PPLC", "PPLG"}
+)
+
+
+def load_geonames_cities(path: str) -> dict[str, tuple[GeoCity, ...]]:
+    """Load the local GeoNames cities15000 dump once per scanner process."""
+    absolute = os.path.abspath(path)
+    with _GEONAMES_LOCK:
+        cached = _GEONAMES_DATASETS.get(absolute)
+        if cached is not None:
+            return cached
+        grouped: dict[str, list[GeoCity]] = collections.defaultdict(list)
+        try:
+            with open(absolute, encoding="utf-8") as handle:
+                for line in handle:
+                    fields = line.rstrip("\n").split("\t")
+                    if len(fields) < 15:
+                        continue
+                    country = fields[8].upper()
+                    if country not in ISO_COUNTRY_CODES:
+                        continue
+                    # cities15000 also contains boroughs/sections (PPLX) and
+                    # historical or non-city populated places. Those labels are
+                    # too granular or misleading for a consumer VPN product.
+                    if fields[7].upper() not in GEONAMES_CITY_FEATURE_CODES:
+                        continue
+                    try:
+                        latitude = float(fields[4])
+                        longitude = float(fields[5])
+                        population = int(fields[14] or 0)
+                    except ValueError:
+                        continue
+                    name = city_display_name(fields[1] or fields[2], country)
+                    if not name:
+                        continue
+                    grouped[country].append(
+                        GeoCity(
+                            name,
+                            country,
+                            latitude,
+                            longitude,
+                            population,
+                            fields[7].upper(),
+                        )
+                    )
+        except OSError:
+            grouped = collections.defaultdict(list)
+        dataset = {
+            country: tuple(cities) for country, cities in grouped.items()
+        }
+        _GEONAMES_DATASETS[absolute] = dataset
+        return dataset
+
+
+def nearest_geonames_city(
+    path: str,
+    country_code: str | None,
+    latitude: float,
+    longitude: float,
+    max_distance_km: float,
+) -> tuple[GeoCity | None, float]:
+    """Find a nearby significant city without any network/API request."""
+    country = (country_code or "").upper()
+    cities = load_geonames_cities(path).get(country, ())
+    best_city: GeoCity | None = None
+    best_distance = math.inf
+    nearby: list[tuple[GeoCity, float]] = []
+    for city in cities:
+        # Cheap bounding box avoids most trigonometry for large countries.
+        if abs(city.latitude - latitude) > 0.5:
+            continue
+        longitude_window = max(
+            0.5,
+            max_distance_km
+            / max(10.0, 111.0 * abs(math.cos(math.radians(latitude)))),
+        )
+        if abs(city.longitude - longitude) > longitude_window:
+            continue
+        distance = _haversine_km(
+            latitude, longitude, city.latitude, city.longitude
+        )
+        if distance <= max_distance_km:
+            nearby.append((city, distance))
+        if distance < best_distance or (
+            math.isclose(distance, best_distance, abs_tol=0.05)
+            and best_city is not None
+            and city.population > best_city.population
+        ):
+            best_city = city
+            best_distance = distance
+    if best_distance > max_distance_km:
+        return None, best_distance
+    # A few GeoNames PPL entries are neighbourhood-like even though they are not
+    # tagged PPLX. Prefer a clearly dominant metro/administrative city only when
+    # it is almost as close as the nearest entry. This turns labels such as a
+    # Tokyo neighbourhood into "Tokyo" without mapping distant towns to it.
+    if best_city is not None:
+        representative_radius = min(max_distance_km, best_distance + 5.0)
+        representative, representative_distance = max(
+            (
+                (city, distance)
+                for city, distance in nearby
+                if distance <= representative_radius
+            ),
+            key=lambda item: (item[0].population, -item[1]),
+        )
+        if representative.population >= max(
+            100_000, best_city.population * 5
+        ):
+            best_city = representative
+            best_distance = representative_distance
+    return best_city, best_distance
+
+
 def corroborate_exit_geo(
     trace: ExitTrace,
     db_record: dict[str, Any] | None,
     airport: dict[str, Any] | None,
     max_distance_km: float,
+    geonames_city: GeoCity | None = None,
+    geonames_distance_km: float = math.inf,
+    geonames_max_distance_km: float = 25.0,
 ) -> ExitGeo:
     """Use DB-IP city only when live Cloudflare routing corroborates it."""
     record = db_record if isinstance(db_record, dict) else {}
@@ -1402,6 +1633,15 @@ def corroborate_exit_geo(
     city_names = city_data.get("names")
     city_names = city_names if isinstance(city_names, dict) else {}
     city = city_display_name(str(city_names.get("en", "")), country_code)
+    city_source = "dbip" if city else None
+    if (
+        not city
+        and geonames_city is not None
+        and geonames_city.country_code == country_code
+        and geonames_distance_km <= geonames_max_distance_km
+    ):
+        city = city_display_name(geonames_city.name, country_code)
+        city_source = "geonames_nearest" if city else None
 
     location = record.get("location")
     location = location if isinstance(location, dict) else {}
@@ -1416,12 +1656,27 @@ def corroborate_exit_geo(
         )
     except (KeyError, TypeError, ValueError):
         distance = math.inf
+    geonames_routing_agrees = True
+    if city_source == "geonames_nearest" and geonames_city is not None:
+        try:
+            geonames_routing_agrees = (
+                _haversine_km(
+                    geonames_city.latitude,
+                    geonames_city.longitude,
+                    float(airport_data["lat"]),
+                    float(airport_data["lon"]),
+                )
+                <= max_distance_km
+            )
+        except (KeyError, TypeError, ValueError):
+            geonames_routing_agrees = False
 
     city_confident = bool(
         city
         and countries_agree
         and airport_country == country_code
         and distance <= max_distance_km
+        and geonames_routing_agrees
     )
     return ExitGeo(
         trace.ip,
@@ -1429,13 +1684,14 @@ def corroborate_exit_geo(
         country_name,
         city if city_confident else None,
         city_confident,
+        city_source if city_confident else None,
     )
 
 
 _GEO_LOCK = threading.Lock()
 _GEO_READERS: dict[str, Any] = {}
 _IATA_AIRPORTS: dict[str, dict[str, Any]] | None = None
-_GEO_RESULT_CACHE: dict[tuple[str, str, str, str, float], ExitGeo] = {}
+_GEO_RESULT_CACHE: dict[tuple[Any, ...], ExitGeo] = {}
 
 
 def resolve_exit_geo(trace: ExitTrace, settings: Settings) -> ExitGeo:
@@ -1446,12 +1702,15 @@ def resolve_exit_geo(trace: ExitTrace, settings: Settings) -> ExitGeo:
     db_record: dict[str, Any] | None = None
     airport: dict[str, Any] | None = None
     db_path = os.path.abspath(settings.geoip_db_path)
+    geonames_path = os.path.abspath(settings.geonames_cities_path)
     cache_key = (
         db_path,
+        geonames_path,
         trace.ip,
         trace.country or "",
         trace.colo or "",
         settings.geo_city_max_distance_km,
+        settings.geonames_nearest_city_km,
     )
     try:
         with _GEO_LOCK:
@@ -1477,8 +1736,42 @@ def resolve_exit_geo(trace: ExitTrace, settings: Settings) -> ExitGeo:
                 airport = _IATA_AIRPORTS.get(trace.colo)
     except (ImportError, OSError, ValueError):
         pass
+    geonames_city: GeoCity | None = None
+    geonames_distance = math.inf
+    if isinstance(db_record, dict):
+        country_data = db_record.get("country")
+        country_data = country_data if isinstance(country_data, dict) else {}
+        db_country = str(country_data.get("iso_code", "")).upper()
+        city_data = db_record.get("city")
+        city_data = city_data if isinstance(city_data, dict) else {}
+        city_names = city_data.get("names")
+        city_names = city_names if isinstance(city_names, dict) else {}
+        existing_city = city_display_name(
+            str(city_names.get("en", "")), db_country
+        )
+        location = db_record.get("location")
+        location = location if isinstance(location, dict) else {}
+        if not existing_city and db_country in ISO_COUNTRY_CODES:
+            try:
+                latitude = float(location["latitude"])
+                longitude = float(location["longitude"])
+                geonames_city, geonames_distance = nearest_geonames_city(
+                    geonames_path,
+                    db_country,
+                    latitude,
+                    longitude,
+                    settings.geonames_nearest_city_km,
+                )
+            except (KeyError, TypeError, ValueError):
+                pass
     result = corroborate_exit_geo(
-        trace, db_record, airport, settings.geo_city_max_distance_km
+        trace,
+        db_record,
+        airport,
+        settings.geo_city_max_distance_km,
+        geonames_city,
+        geonames_distance,
+        settings.geonames_nearest_city_km,
     )
     with _GEO_LOCK:
         _GEO_RESULT_CACHE[cache_key] = result
@@ -1745,6 +2038,7 @@ def speed_test_node(
         exit_country_name=exit_geo.country_name,
         exit_city=exit_geo.city,
         geo_city_confident=exit_geo.city_confident,
+        exit_city_source=exit_geo.city_source,
     )
 
 
@@ -1820,6 +2114,11 @@ def combine_stream_results(
         ),
         exit_city=agreed_city,
         geo_city_confident=geo_city_confident,
+        exit_city_source=(
+            primary.exit_city_source or secondary.exit_city_source
+            if geo_city_confident
+            else None
+        ),
     )
 
 
@@ -1861,6 +2160,39 @@ def allocate_stable_server_id(
     raise ScannerError("Stable server ID space is exhausted")
 
 
+def record_country_code(
+    record: dict[str, Any], result: TestResult | None
+) -> str | None:
+    """Resolve country by live egress, saved egress, then original source name."""
+    code = result.exit_country if result is not None else None
+    if not code:
+        stored_code = str(record.get("country", "")).upper()
+        code = stored_code if stored_code in ISO_COUNTRY_CODES else None
+    if not code:
+        source_names = record.get("source_names", [])
+        names = (
+            [str(item) for item in source_names]
+            if isinstance(source_names, (list, tuple, set))
+            else []
+        )
+        names.append(str(record.get("name", "")))
+        detected_codes = {
+            detected
+            for name in names
+            # Provider tags such as ``[BL]`` appear after ``|`` and must not be
+            # mistaken for an ISO country code (BL is Saint Barthelemy).
+            if (
+                detected := country_from_name(
+                    html.unescape(urllib.parse.unquote(name)).split("|", 1)[0]
+                )
+            )
+            in ISO_COUNTRY_CODES
+        }
+        if len(detected_codes) == 1:
+            code = next(iter(detected_codes))
+    return code if code in ISO_COUNTRY_CODES else None
+
+
 def normalize_published_names(
     records: list[dict[str, Any]],
     results: dict[str, TestResult],
@@ -1870,41 +2202,46 @@ def normalize_published_names(
     unknown = 0
     city_detected = 0
     city_omitted = 0
+    publishable: list[dict[str, Any]] = []
     for record in records:
         fingerprint = str(record.get("fingerprint", ""))
         result = results.get(fingerprint)
-        code = result.exit_country if result is not None else None
-        if not code:
-            stored_code = str(record.get("country", "")).upper()
-            code = stored_code if stored_code in ISO_COUNTRY_CODES else None
-        if not code:
-            code = country_from_name(str(record.get("name", "")))
-        if code not in ISO_COUNTRY_CODES:
-            code = "UN"
+        code = record_country_code(record, result)
+        if code is None:
             unknown += 1
-        else:
-            detected += 1
+            continue
+        detected += 1
 
         suggested_country = (
             result.exit_country_name if result is not None else None
         ) or str(record.get("country_name", ""))
-        country_name = (
-            country_display_name(code, suggested_country)
-            if code != "UN"
-            else "Unknown"
-        )
+        country_name = country_display_name(code, suggested_country)
         city: str | None = None
+        city_source: str | None = None
         if result is not None and result.geo_city_confident and result.exit_city:
             city = result.exit_city
+            city_source = result.exit_city_source or "geoip"
         elif result is None or record.get("status") in {"grace", "preserved"}:
             stored_city = str(record.get("city", "")).strip()
             if stored_city and record.get("city_confident") is True:
                 city = stored_city
+                stored_source = str(record.get("city_source", ""))
+                city_source = (
+                    stored_source
+                    if stored_source
+                    in {"geoip", "dbip", "geonames_nearest", "subscription_name"}
+                    else "geoip"
+                )
         city = city_display_name(city, code)
+        if not city:
+            city = source_city_from_record(record, code)
+            if city:
+                city_source = "subscription_name"
         # City-states and same-named capitals otherwise produce labels such as
         # "Singapore · Singapore". The second copy adds no useful information.
         if city and location_label_key(city) == location_label_key(country_name):
             city = None
+            city_source = None
         if city:
             city_detected += 1
         else:
@@ -1928,7 +2265,10 @@ def normalize_published_names(
         record["country_name"] = country_name
         record["city"] = city
         record["city_confident"] = bool(city)
+        record["city_source"] = city_source if city else None
         record["server_id"] = server_id
+        publishable.append(record)
+    records[:] = publishable
     return detected, unknown, city_detected, city_omitted
 
 
@@ -1985,6 +2325,7 @@ def apply_stream_result(
         result.exit_country_name = stream.exit_country_name
         result.exit_city = stream.exit_city
         result.geo_city_confident = stream.geo_city_confident
+        result.exit_city_source = stream.exit_city_source
 
     if result.stream_quality in {"strong", "good"}:
         return
@@ -2260,6 +2601,7 @@ def make_record(
         "uri": node.uri,
         "protocol": node.protocol,
         "name": node.name,
+        "source_names": sorted(node.source_names or {node.name}),
         "source_ids": sorted(node.source_ids),
         "status": "healthy",
         "last_success": now,
@@ -2290,6 +2632,9 @@ def make_record(
         "country_name": result.exit_country_name,
         "city": result.exit_city if result.geo_city_confident else None,
         "city_confident": result.geo_city_confident,
+        "city_source": (
+            result.exit_city_source if result.geo_city_confident else None
+        ),
     }
 
 
@@ -2340,7 +2685,7 @@ a{{display:inline-block;margin-right:14px}}
 </style></head><body><h1>MezaVPN Subscription Status</h1>
 <p><a href="sub.txt">sub.txt</a><a href="sub-raw.txt">sub-raw.txt</a><a href="status.json">status.json</a></p>
 <pre>{status_html}</pre>
-<p><small><a href="https://db-ip.com">IP Geolocation by DB-IP</a></small></p>
+<p><small><a href="https://db-ip.com">IP Geolocation by DB-IP</a> · <a href="https://www.geonames.org/">City data by GeoNames</a></small></p>
 </body></html>"""
     (output_dir / "index.html").write_text(page, encoding="utf-8")
 
@@ -2361,7 +2706,11 @@ a{{display:inline-block;margin-right:14px}}
         f"- Independent fallback recoveries: `{status['stream_test']['fallback_recovered']}`",
         f"- Multi-endpoint failures: `{status['broken']['stream_multi_endpoint_failed']}`",
         f"- Confident exit cities: `{status['naming']['city_confident']}`",
+        f"- Cities recovered from nearby GeoNames data: `{status['naming']['city_from_geonames_nearest']}`",
+        f"- Cities recovered from matching source names: `{status['naming']['city_from_source_name']}`",
+        f"- Total city labels displayed: `{status['naming']['city_displayed']}`",
         f"- City omitted as uncertain: `{status['naming']['city_omitted']}`",
+        f"- Country-unknown configs excluded: `{status['naming']['country_unknown_excluded']}`",
         f"- Stable server IDs retained: `{status['naming']['stable_ids_registered']}`",
         f"- Stable server ID range: `{status['naming']['stable_id_range']}` "
         "(4 digits preferred)",
@@ -2445,9 +2794,11 @@ def run(args: argparse.Namespace) -> int:
             existing = nodes.get(node.fingerprint)
             if existing is None:
                 node.source_ids.add(source.source_id)
+                node.source_names.add(node.name)
                 nodes[node.fingerprint] = node
             else:
                 existing.source_ids.add(source.source_id)
+                existing.source_names.add(node.name)
 
     if len(nodes) > settings.max_configs:
         prioritized = sorted(
@@ -2748,6 +3099,7 @@ def run(args: argparse.Namespace) -> int:
             record = dict(previous)
             record["uri"] = node.uri
             record["source_ids"] = sorted(node.source_ids)
+            record["source_names"] = sorted(node.source_names or {node.name})
             record["status"] = "grace"
             record["failure_streak"] = int(previous.get("failure_streak", 0) or 0) + 1
             current_records[fingerprint] = record
@@ -2773,10 +3125,24 @@ def run(args: argparse.Namespace) -> int:
         record["fingerprint"] = fingerprint
         record["score"] = record_score(record, settings)
 
-    eligible = [
+    viable_records = [
         record
         for record in current_records.values()
         if float(record.get("latency_ms") or 99_999) <= settings.max_latency_ms
+    ]
+    unknown_country_fingerprints = {
+        str(record.get("fingerprint", ""))
+        for record in viable_records
+        if record_country_code(
+            record, results.get(str(record.get("fingerprint", "")))
+        )
+        is None
+    }
+    eligible = [
+        record
+        for record in viable_records
+        if str(record.get("fingerprint", ""))
+        not in unknown_country_fingerprints
     ]
     eligible.sort(
         key=lambda record: (
@@ -2831,12 +3197,36 @@ def run(args: argparse.Namespace) -> int:
         safety_mode = "accepted_after_repeated_degradation"
         suspicious_streak = 0
 
+    unknown_country_fingerprints.update(
+        str(record.get("fingerprint", ""))
+        for record in selected
+        if record_country_code(
+            record, results.get(str(record.get("fingerprint", "")))
+        )
+        is None
+    )
     (
         country_detected,
-        country_unknown,
+        _country_unknown_selected,
         city_detected,
         city_omitted,
     ) = normalize_published_names(selected, results, server_ids)
+    country_unknown = len(unknown_country_fingerprints)
+    geoip_city_count = sum(
+        1
+        for record in selected
+        if record.get("city_source") in {"geoip", "dbip"}
+    )
+    geonames_city_count = sum(
+        1
+        for record in selected
+        if record.get("city_source") == "geonames_nearest"
+    )
+    source_name_city_count = sum(
+        1
+        for record in selected
+        if record.get("city_source") == "subscription_name"
+    )
     elite_count = sum(
         1 for record in selected if float(record.get("latency_ms") or 99_999) <= settings.elite_latency_ms
     )
@@ -2971,17 +3361,26 @@ def run(args: argparse.Namespace) -> int:
         "naming": {
             "format": "Country · City #StableID (city omitted when uncertain)",
             "country_label_policy": "canonical short product label; never raw GeoIP wording",
-            "city_label_policy": "city only; administrative qualifiers removed; suspicious labels omitted",
+            "city_label_policy": "corroborated DB-IP city first; nearby GeoNames recovery only for missing cities; matching Country, City source-name fallback; conflicts omitted",
             "city_label_max_characters": MAX_CITY_DISPLAY_LENGTH,
             "country_detected": country_detected,
             "country_unknown": country_unknown,
-            "city_confident": city_detected,
+            "country_unknown_excluded": country_unknown,
+            "city_displayed": city_detected,
+            "city_confident": geoip_city_count + geonames_city_count,
+            "city_from_dbip": geoip_city_count,
+            "city_from_geonames_nearest": geonames_city_count,
+            "city_from_source_name": source_name_city_count,
             "city_omitted": city_omitted,
             "stable_ids_registered": len(server_ids),
             "stable_id_range": "1000-99999",
             "stable_id_policy": "prefer 4 digits; use 5 digits only after 1000-9999 is exhausted",
-            "geoip_mode": "actual egress IP; DB-IP City corroborated by Cloudflare country and colo distance",
+            "geoip_mode": "actual tunnel egress IP from Cloudflare trace, with ipify/AWS IP-only fallback; local DB-IP lookup",
             "geoip_database_available": os.path.isfile(settings.geoip_db_path),
+            "geonames_database_available": os.path.isfile(
+                settings.geonames_cities_path
+            ),
+            "geonames_nearest_city_km": settings.geonames_nearest_city_km,
         },
         "safety_mode": safety_mode,
         "duration_seconds": round(time.monotonic() - started, 2),

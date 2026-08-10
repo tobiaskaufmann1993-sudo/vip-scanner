@@ -1,7 +1,9 @@
 import base64
 import dataclasses
 import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import scanner
@@ -106,21 +108,29 @@ class ScannerParserTests(unittest.TestCase):
     def test_private_and_additional_sources_are_merged_and_deduplicated(self):
         first = "https://example.com/private-one"
         second = "https://example.com/private-two"
-        public = (
+        retired = (
             "https://raw.githubusercontent.com/MahsaNetConfigTopic/config/"
             "refs/heads/main/xray_final.txt"
+        )
+        public_one = (
+            "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/"
+            "refs/heads/main/BLACK_VLESS_RUS.txt"
+        )
+        public_two = (
+            "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/"
+            "refs/heads/main/BLACK_VLESS_RUS_mobile.txt"
         )
         with mock.patch.dict(
             scanner.os.environ,
             {
-                "SUB_URLS": f"{first}\n{second}\n{public}",
-                "ADDITIONAL_SUB_URLS": public,
+                "SUB_URLS": f"{first}\n{second}\n{retired}\n{public_one}",
+                "ADDITIONAL_SUB_URLS": f"{public_one}\n{public_two}",
             },
             clear=False,
         ):
             self.assertEqual(
                 scanner.configured_source_urls(),
-                [first, second, public],
+                [first, second, public_one, public_two],
             )
 
     def test_html_escaped_query_separators_are_restored(self):
@@ -136,6 +146,15 @@ class ScannerParserTests(unittest.TestCase):
         self.assertEqual(stream["network"], "websocket")
         self.assertEqual(stream["tlsSettings"]["serverName"], "cdn.example.com")
         self.assertEqual(stream["wsSettings"]["host"], "cdn.example.com")
+
+    def test_vless_security_false_is_treated_as_no_tls(self):
+        uri = (
+            f"vless://{UUID}@example.com:80?security=false&type=ws"
+            "&host=cdn.example.com&path=%2F#NoTLS"
+        )
+        node = scanner.parse_node(uri)
+        self.assertEqual(node.outbound["streamSettings"]["security"], "none")
+        self.assertEqual(node.outbound["streamSettings"]["network"], "websocket")
 
     def test_country_detection_from_flag_code_and_full_name(self):
         self.assertEqual(scanner.country_from_name("🇩🇪 | @WhiteDNS | DE33|GPT-US"), "DE")
@@ -184,6 +203,17 @@ class ScannerParserTests(unittest.TestCase):
             trace = scanner.detect_exit_trace(19080, 5.0)
         self.assertEqual(trace, scanner.ExitTrace("203.0.113.1", "JP", "NRT"))
 
+    def test_exit_ip_falls_back_through_same_proxy_when_trace_fails(self):
+        failed_trace = mock.Mock(returncode=22, stdout="")
+        ipify = mock.Mock(returncode=0, stdout="198.51.100.24\n")
+        with mock.patch.object(
+            scanner.subprocess, "run", side_effect=[failed_trace, ipify]
+        ) as run:
+            trace = scanner.detect_exit_trace(19080, 5.0)
+        self.assertEqual(trace, scanner.ExitTrace("198.51.100.24", None, None))
+        self.assertIn("socks5h://127.0.0.1:19080", run.call_args_list[1].args[0])
+        self.assertIn("https://api64.ipify.org", run.call_args_list[1].args[0])
+
     def test_geo_city_requires_country_and_distance_corroboration(self):
         trace = scanner.ExitTrace("203.0.113.8", "DE", "FRA")
         record = {
@@ -210,6 +240,119 @@ class ScannerParserTests(unittest.TestCase):
         self.assertEqual(mismatch.country_code, "DE")
         self.assertIsNone(mismatch.city)
         self.assertFalse(mismatch.city_confident)
+
+    def test_geonames_recovers_only_a_missing_nearby_city(self):
+        trace = scanner.ExitTrace("203.0.113.8", "DE", "FRA")
+        record = {
+            "country": {"iso_code": "DE", "names": {"en": "Germany"}},
+            "city": {"names": {}},
+            "location": {"latitude": 50.1109, "longitude": 8.6821},
+        }
+        airport = {"country": "DE", "lat": 50.0379, "lon": 8.5622}
+        nearby = scanner.GeoCity("Frankfurt am Main", "DE", 50.1109, 8.6821)
+        geo = scanner.corroborate_exit_geo(
+            trace, record, airport, 80.0, nearby, 0.0, 25.0
+        )
+        self.assertEqual(geo.city, "Frankfurt")
+        self.assertTrue(geo.city_confident)
+        self.assertEqual(geo.city_source, "geonames_nearest")
+
+        too_far = scanner.corroborate_exit_geo(
+            trace, record, airport, 80.0, nearby, 25.1, 25.0
+        )
+        self.assertIsNone(too_far.city)
+        self.assertFalse(too_far.city_confident)
+
+    def test_existing_dbip_city_is_never_replaced_by_geonames(self):
+        trace = scanner.ExitTrace("203.0.113.8", "DE", "FRA")
+        record = {
+            "country": {"iso_code": "DE", "names": {"en": "Germany"}},
+            "city": {"names": {"en": "Frankfurt"}},
+            "location": {"latitude": 50.1109, "longitude": 8.6821},
+        }
+        airport = {"country": "DE", "lat": 50.0379, "lon": 8.5622}
+        different = scanner.GeoCity("Wiesbaden", "DE", 50.0826, 8.2493)
+        geo = scanner.corroborate_exit_geo(
+            trace, record, airport, 80.0, different, 10.0, 25.0
+        )
+        self.assertEqual(geo.city, "Frankfurt")
+        self.assertEqual(geo.city_source, "dbip")
+
+    def test_geonames_local_dump_finds_nearest_city_within_same_country(self):
+        def row(
+            geoname_id,
+            name,
+            latitude,
+            longitude,
+            country,
+            population,
+            feature_code="PPL",
+        ):
+            fields = [""] * 19
+            fields[0] = str(geoname_id)
+            fields[1] = name
+            fields[2] = name
+            fields[4] = str(latitude)
+            fields[5] = str(longitude)
+            fields[7] = feature_code
+            fields[8] = country
+            fields[14] = str(population)
+            return "\t".join(fields)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cities15000.txt"
+            path.write_text(
+                "\n".join(
+                    (
+                        row(1, "Frankfurt am Main", 50.1109, 8.6821, "DE", 650000),
+                        row(2, "Berlin", 52.52, 13.405, "DE", 3600000),
+                        row(3, "Strasbourg", 48.5734, 7.7521, "FR", 290000),
+                        row(4, "Frankfurt District", 50.12, 8.69, "DE", 900000, "PPLX"),
+                    )
+                ),
+                encoding="utf-8",
+            )
+            city, distance = scanner.nearest_geonames_city(
+                str(path), "DE", 50.12, 8.69, 25.0
+            )
+            self.assertIsNotNone(city)
+            self.assertEqual(city.name, "Frankfurt")
+            self.assertLess(distance, 2.0)
+            absent, _ = scanner.nearest_geonames_city(
+                str(path), "DE", 51.0, 10.0, 25.0
+            )
+            self.assertIsNone(absent)
+
+    def test_geonames_prefers_a_dominant_city_over_a_nearby_small_district(self):
+        def row(geoname_id, name, latitude, population, feature_code):
+            fields = [""] * 19
+            fields[0] = str(geoname_id)
+            fields[1] = name
+            fields[2] = name
+            fields[4] = str(latitude)
+            fields[5] = "139.65"
+            fields[7] = feature_code
+            fields[8] = "JP"
+            fields[14] = str(population)
+            return "\t".join(fields)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cities15000.txt"
+            path.write_text(
+                "\n".join(
+                    (
+                        row(1, "Small Locality", 35.6762, 19000, "PPL"),
+                        row(2, "Tokyo", 35.7000, 9733276, "PPLC"),
+                    )
+                ),
+                encoding="utf-8",
+            )
+            city, distance = scanner.nearest_geonames_city(
+                str(path), "JP", 35.6762, 139.65, 25.0
+            )
+            self.assertIsNotNone(city)
+            self.assertEqual(city.name, "Tokyo")
+            self.assertLess(distance, 5.0)
 
     def test_city_display_name_uses_familiar_stable_labels(self):
         self.assertEqual(scanner.city_display_name("Frankfurt am Main"), "Frankfurt")
@@ -245,6 +388,115 @@ class ScannerParserTests(unittest.TestCase):
             scanner.city_display_name("An Implausibly Long Administrative Place Name")
         )
         self.assertIsNone(scanner.city_display_name(""))
+
+    def test_source_city_hint_requires_matching_country_and_clean_pattern(self):
+        self.assertEqual(
+            scanner.source_city_from_name(
+                "🇳🇱 The Netherlands, Amsterdam | [BL]", "NL"
+            ),
+            "Amsterdam",
+        )
+        self.assertEqual(
+            scanner.source_city_from_name(
+                "🇩🇪 Germany, Frankfurt am Main | [BL]", "DE"
+            ),
+            "Frankfurt",
+        )
+        self.assertIsNone(
+            scanner.source_city_from_name(
+                "🇹🇷 Turkey, Istanbul | [BL]", "RO"
+            )
+        )
+        self.assertIsNone(scanner.source_city_from_name("France | [BL]", "FR"))
+
+    def test_provider_tag_is_not_mistaken_for_country(self):
+        record = {
+            "name": "Unlocated server | [BL]",
+            "source_names": ["Unlocated server | [BL]"],
+        }
+        self.assertIsNone(scanner.record_country_code(record, None))
+
+    def test_duplicate_source_city_hints_must_agree(self):
+        matching = {
+            "name": "Netherlands source",
+            "source_names": [
+                "🇳🇱 Netherlands, Amsterdam | [BL]",
+                "🇳🇱 The Netherlands, Amsterdam | another source",
+            ],
+        }
+        conflicting = {
+            "name": "Netherlands source",
+            "source_names": [
+                "🇳🇱 Netherlands, Amsterdam | [BL]",
+                "🇳🇱 Netherlands, Rotterdam | another source",
+            ],
+        }
+        self.assertEqual(
+            scanner.source_city_from_record(matching, "NL"), "Amsterdam"
+        )
+        self.assertIsNone(scanner.source_city_from_record(conflicting, "NL"))
+
+    def test_matching_source_city_fills_only_missing_geoip_city(self):
+        uri = f"vless://{UUID}@se.example:443#Old"
+        parsed = scanner.parse_node(uri)
+        records = [
+            {
+                "fingerprint": parsed.fingerprint,
+                "name": "🇸🇪 Sweden, Stockholm | [BL]",
+                "source_names": ["🇸🇪 Sweden, Stockholm | [BL]"],
+                "uri": uri,
+            }
+        ]
+        results = {
+            parsed.fingerprint: scanner.TestResult(
+                parsed.fingerprint,
+                True,
+                3,
+                3,
+                100,
+                10,
+                1.0,
+                "ok",
+                exit_country="SE",
+                exit_country_name="Sweden",
+                exit_city=None,
+                geo_city_confident=False,
+            )
+        }
+        scanner.normalize_published_names(records, results, {})
+        self.assertRegex(records[0]["name"], r"^Sweden · Stockholm #\d{4,5}$")
+        self.assertEqual(records[0]["city_source"], "subscription_name")
+
+    def test_geoip_city_wins_over_source_name_hint(self):
+        uri = f"vless://{UUID}@se.example:443#Old"
+        parsed = scanner.parse_node(uri)
+        records = [
+            {
+                "fingerprint": parsed.fingerprint,
+                "name": "🇸🇪 Sweden, Stockholm | [BL]",
+                "source_names": ["🇸🇪 Sweden, Stockholm | [BL]"],
+                "uri": uri,
+            }
+        ]
+        results = {
+            parsed.fingerprint: scanner.TestResult(
+                parsed.fingerprint,
+                True,
+                3,
+                3,
+                100,
+                10,
+                1.0,
+                "ok",
+                exit_country="SE",
+                exit_country_name="Sweden",
+                exit_city="Gothenburg",
+                geo_city_confident=True,
+            )
+        }
+        scanner.normalize_published_names(records, results, {})
+        self.assertRegex(records[0]["name"], r"^Sweden · Gothenburg #\d{4,5}$")
+        self.assertEqual(records[0]["city_source"], "geoip")
 
     def test_preserved_names_are_resanitized_before_publication(self):
         uri = f"vless://{UUID}@nl.example:443#Old"
@@ -365,12 +617,13 @@ class ScannerParserTests(unittest.TestCase):
         }
         registry = {}
         counts = scanner.normalize_published_names(records, results, registry)
-        self.assertEqual(counts, (3, 1, 1, 3))
+        self.assertEqual(counts, (3, 1, 1, 2))
+        self.assertEqual(len(records), 3)
         self.assertRegex(records[0]["name"], r"^USA · New York #\d{4,5}$")
         self.assertRegex(records[1]["name"], r"^USA #\d{4,5}$")
         self.assertRegex(records[2]["name"], r"^Canada #\d{4,5}$")
-        self.assertRegex(records[3]["name"], r"^Unknown #\d{4,5}$")
-        self.assertEqual(len(set(registry.values())), 4)
+        self.assertTrue(all("Unknown" not in record["name"] for record in records))
+        self.assertEqual(len(set(registry.values())), 3)
 
         original_ids = dict(registry)
         returning = [
@@ -446,6 +699,10 @@ class ScannerParserTests(unittest.TestCase):
         self.assertEqual(settings.speed_budget_bytes, 96 * 1024 * 1024)
         self.assertEqual(settings.speed_retry_reserve_bytes, 12 * 1024 * 1024)
         self.assertEqual(settings.geo_city_max_distance_km, 80.0)
+        self.assertEqual(
+            settings.geonames_cities_path, ".cache/geoip/cities15000.txt"
+        )
+        self.assertEqual(settings.geonames_nearest_city_km, 25.0)
         self.assertEqual(
             settings.speed_retry_url, "https://proof.ovh.net/files/1Mb.dat"
         )

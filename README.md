@@ -184,11 +184,12 @@ https://example.com/subscription-three
 
 نام Secret باید دقیقاً با حروف بزرگ `SUB_URLS` باشد. لینک‌ها را داخل فایل کد یا README قرار نده.
 
-دو ساب عمومی `BLACK_VLESS_RUS.txt` و `BLACK_VLESS_RUS_mobile.txt` در متغیر `ADDITIONAL_SUB_URLS` داخل Workflow ثبت شده‌اند. اسکنر این آدرس‌ها را با آدرس‌های Secret ادغام می‌کند و اگر URL در هر دو محل تکرار شده باشد، فقط یک بار آن را دریافت می‌کند. ساب بازنشسته MahsaNet حتی اگر هنوز داخل Secret مانده باشد نادیده گرفته می‌شود.
+سه ساب عمومی `BLACK_VLESS_RUS.txt`، `BLACK_VLESS_RUS_mobile.txt` و `whitedns-sub/base64.txt` در متغیر `ADDITIONAL_SUB_URLS` داخل Workflow ثبت شده‌اند. اسکنر این آدرس‌ها را با آدرس‌های Secret ادغام می‌کند و اگر URL در هر دو محل تکرار شده باشد، فقط یک بار آن را دریافت می‌کند. ساب بازنشسته MahsaNet حتی اگر هنوز داخل Secret مانده باشد نادیده گرفته می‌شود.
 
 ```text
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS_mobile.txt
+https://raw.githubusercontent.com/iampedii/whitedns-sub/refs/heads/main/base64.txt
 ```
 
 ## مرحله ۶: اولین اجرای دستی

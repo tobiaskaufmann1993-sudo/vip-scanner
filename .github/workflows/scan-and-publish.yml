@@ -21,6 +21,7 @@ env:
   ADDITIONAL_SUB_URLS: |
     https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt
     https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS_mobile.txt
+    https://raw.githubusercontent.com/iampedii/whitedns-sub/refs/heads/main/base64.txt
   # Broad health filter only; the client performs final regional selection.
   ELITE_LATENCY_MS: "800"
   MAX_LATENCY_MS: "3000"

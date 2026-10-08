@@ -19,6 +19,8 @@ env:
   XRAY_VERSION: "v26.3.27"
   # Public feeds can be tracked here; private feeds remain in the SUB_URLS secret.
   ADDITIONAL_SUB_URLS: |
+    https://raw.githubusercontent.com/mohamadfg-dev/telegram-v2ray-configs-collector/refs/heads/main/category/ss.txt
+    https://raw.githubusercontent.com/amir-reza-bijandi/v2ray-configs/refs/heads/main/configs.txt
     https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt
     https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS_mobile.txt
     https://raw.githubusercontent.com/iampedii/whitedns-sub/refs/heads/main/base64.txt

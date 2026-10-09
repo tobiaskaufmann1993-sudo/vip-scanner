@@ -136,7 +136,11 @@ class Settings:
         "https://connectivitycheck.gstatic.com/generate_204",
         "https://detectportal.firefox.com/success.txt",
         "https://captive.apple.com/hotspot-detect.html",
-        "https://www.cloudflare.com/cdn-cgi/trace",
+        # Deliberately not a Cloudflare-hosted URL: Workers-based and
+        # proxyip-style nodes cannot open connections to Cloudflare-hosted
+        # sites by design, so such a probe would fail on every healthy node of
+        # that kind and push it below the "at most one failure" rule.
+        "https://www.msftconnecttest.com/connecttest.txt",
     )
 
     @classmethod
@@ -3129,6 +3133,48 @@ def run(args: argparse.Namespace) -> int:
             except Exception:
                 continue
             results[finished.fingerprint] = finished
+    # Second chance: a node whose server accepted TCP but whose health test
+    # failed is retested once, later in the same scan. Tunnel setup through
+    # shared CDN / proxy-IP nodes is occasionally slow or reset, and a single
+    # unlucky pass must not decide a node's fate. A node is rejected only when
+    # two independent full tests both fail; one full pass is still required.
+    recoverable_reasons = {"confirmed_unreachable", "insufficient_successes", "unstable"}
+    retry_nodes = [
+        node
+        for node in ordered_nodes
+        if node.fingerprint in results
+        and not results[node.fingerprint].passed
+        and results[node.fingerprint].reason in recoverable_reasons
+    ]
+    recovered = 0
+    if retry_nodes and time.monotonic() < health_deadline:
+        log(f"Second-chance health test for {len(retry_nodes)} configs...")
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=settings.scan_workers)
+        second: dict[concurrent.futures.Future[TestResult], Node] = {}
+        try:
+            for node in retry_nodes:
+                second[executor.submit(test_node, node, xray_bin, settings)] = node
+            for future in concurrent.futures.as_completed(second):
+                again = future.result()
+                if again.passed:
+                    results[again.fingerprint] = again
+                    recovered += 1
+                if time.monotonic() >= health_deadline:
+                    for item in second:
+                        item.cancel()
+                    break
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+        for future, node in second.items():
+            if future.done() and not future.cancelled():
+                try:
+                    again = future.result()
+                except Exception:
+                    continue
+                if again.passed and not results[node.fingerprint].passed:
+                    results[node.fingerprint] = again
+                    recovered += 1
+        log(f"Second chance recovered {recovered} of {len(retry_nodes)} configs.")
     health_not_tested = max(
         0, health_scheduled - sum(1 for node in ordered_nodes if node.fingerprint in results)
     )
@@ -3587,6 +3633,8 @@ def run(args: argparse.Namespace) -> int:
             ),
             "tcp_prefilter_endpoints": tcp_endpoints_checked,
             "tcp_prefilter_rejected": tcp_rejected,
+            "second_chance_tested": len(retry_nodes),
+            "second_chance_recovered": recovered,
             "health_not_tested": health_not_tested,
             "candidate_limit_reached": candidate_limit_reached,
         },

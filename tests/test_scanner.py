@@ -713,6 +713,12 @@ class ScannerParserTests(unittest.TestCase):
             settings.speed_retry_url, "https://proof.ovh.net/files/1Mb.dat"
         )
 
+    def test_health_probes_do_not_depend_on_cloudflare_hosted_urls(self):
+        # Workers/proxyip nodes cannot reach Cloudflare-hosted sites by design.
+        for url in scanner.Settings().probe_urls:
+            self.assertNotIn("cloudflare", url)
+        self.assertGreaterEqual(len(scanner.Settings().probe_urls), 5)
+
     def test_stream_reliability_dominates_small_latency_difference(self):
         settings = scanner.Settings.from_env()
         low_latency = {
@@ -1307,7 +1313,7 @@ class ScannerParserTests(unittest.TestCase):
 class FullRunTests(unittest.TestCase):
     """Drive run() end to end with the network and Xray replaced by fakes."""
 
-    def _run(self, node_count, env):
+    def _run(self, node_count, env, health=None):
         import argparse
         import os
 
@@ -1370,7 +1376,7 @@ class FullRunTests(unittest.TestCase):
             with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
                 scanner, "fetch_source",
                 return_value=scanner.SourceResult("feed", True, links),
-            ), mock.patch.object(scanner, "test_node", fake_test_node), mock.patch.object(
+            ), mock.patch.object(scanner, "test_node", health or fake_test_node), mock.patch.object(
                 scanner, "speed_test_node", fake_speed
             ), mock.patch.object(scanner, "tcp_connect_check", fake_tcp):
                 self.assertEqual(scanner.run(args), 0)
@@ -1412,6 +1418,34 @@ class FullRunTests(unittest.TestCase):
         self.assertEqual(configs["published"], configs["passed_current"])
         self.assertGreater(configs["provisional_published"], 0)
         self.assertEqual(status["broken"]["stream_unverified"], 0)
+
+    def test_second_chance_recovers_a_node_that_failed_once(self):
+        attempts = {}
+
+        def flaky(node, xray_bin, settings):
+            count = attempts[node.fingerprint] = attempts.get(node.fingerprint, 0) + 1
+            number = int(node.fingerprint[:6], 16)
+            if number % 4 == 0 or (number % 4 == 1 and count == 1):
+                return scanner.TestResult(
+                    node.fingerprint, False, 1, 3, None, None, 0.33,
+                    "insufficient_successes", error="curl: (28) timed out",
+                )
+            return scanner.TestResult(
+                node.fingerprint, True, 3, 3, 250.0, 30.0, 1.0, "ok",
+                exit_country="DE", exit_ip="203.0.113.7", exit_country_name="Germany",
+            )
+
+        status, _published, _state, _calls = self._run(
+            300, {"MAX_OUTPUT": "450"}, health=flaky
+        )
+        configs = status["configs"]
+        self.assertGreater(configs["second_chance_tested"], 0)
+        self.assertGreater(configs["second_chance_recovered"], 0)
+        # A node that fails twice is still rejected.
+        self.assertLess(
+            configs["second_chance_recovered"], configs["second_chance_tested"]
+        )
+        self.assertEqual(configs["published"], configs["passed_current"])
 
     def test_candidate_cap_rotates_but_keeps_running(self):
         status, _published, _state, _calls = self._run(

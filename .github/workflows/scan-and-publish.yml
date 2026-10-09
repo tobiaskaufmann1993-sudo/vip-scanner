@@ -215,8 +215,18 @@ jobs:
           python scanner.py \
             --xray .tools/xray/xray \
             --output-dir public \
-            --previous-state-url "$PREVIOUS_STATE_URL"
+            --previous-state-url "$PREVIOUS_STATE_URL" \
+            --diagnostics-file diagnostics/rejected.json
           cat public/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep anonymous rejection diagnostics (no hosts or links)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rejection-diagnostics
+          path: diagnostics/rejected.json
+          retention-days: 3
+          if-no-files-found: ignore
 
       - name: Publish subscription mirror to ArvanCloud
         id: arvan_upload

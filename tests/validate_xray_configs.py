@@ -49,6 +49,10 @@ def sample_uris() -> list[str]:
         ),
         vmess_uri(),
         "trojan://password@127.0.0.1:443?security=tls&sni=example.com&type=tcp#schema-trojan",
+        # No ``security`` parameter: Trojan defaults to TLS.
+        "trojan://password@127.0.0.1:443?sni=example.com&type=ws&host=example.com&path=%2Fa#schema-trojan-default-tls",
+        # allowInsecure is removed from Xray; the probe must pin instead.
+        "trojan://password@127.0.0.1:443?allowInsecure=1&sni=example.com#schema-trojan-insecure",
         f"ss://{ss_user}@127.0.0.1:8388#schema-ss",
     ]
 
@@ -62,6 +66,9 @@ def main() -> int:
     if not xray.is_file():
         print(f"Xray binary not found: {xray}", file=sys.stderr)
         return 2
+
+    # Offline schema check: stand in for the live certificate fetch.
+    scanner.fetch_peer_cert_sha256 = lambda host, port, name: "ab" * 32
 
     for uri in sample_uris():
         node = scanner.parse_node(uri)

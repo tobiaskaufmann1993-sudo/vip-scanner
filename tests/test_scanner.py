@@ -1148,6 +1148,131 @@ class ScannerParserTests(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertEqual(result.reason, "unstable_jitter")
 
+    def test_trojan_without_security_parameter_uses_tls(self):
+        node = scanner.parse_node(
+            "trojan://pw@example.com:443?sni=cdn.example.com&type=ws&host=cdn.example.com&path=%2Fa#t"
+        )
+        stream = node.outbound["streamSettings"]
+        self.assertEqual(stream["security"], "tls")
+        self.assertEqual(stream["tlsSettings"]["serverName"], "cdn.example.com")
+        # An explicit value still wins, and VLESS keeps its plaintext default.
+        explicit = scanner.parse_node("trojan://pw@example.com:443?security=none&type=tcp#t")
+        self.assertEqual(explicit.outbound["streamSettings"]["security"], "none")
+        vless = scanner.parse_node(f"vless://{UUID}@example.com:443?type=tcp#v")
+        self.assertEqual(vless.outbound["streamSettings"]["security"], "none")
+        blank = scanner.parse_node("trojan://pw@example.com:443?security=&sni=a.example#t")
+        self.assertEqual(blank.outbound["streamSettings"]["security"], "tls")
+
+    def test_allow_insecure_is_replaced_by_a_pinned_certificate_for_probes(self):
+        node = scanner.parse_node(
+            "trojan://pw@example.com:443?allowInsecure=1&sni=self.example#t"
+        )
+        before = json.dumps(node.outbound, sort_keys=True)
+        with mock.patch.object(
+            scanner, "fetch_peer_cert_sha256", return_value="cd" * 32
+        ) as fetch:
+            config = scanner.build_xray_config(node, 19080)
+        tls = config["outbounds"][0]["streamSettings"]["tlsSettings"]
+        self.assertNotIn("allowInsecure", tls)
+        self.assertEqual(tls["pinnedPeerCertSha256"], "cd" * 32)
+        fetch.assert_called_once_with("example.com", 443, "self.example")
+        # The node itself (and so its fingerprint and published link) is untouched.
+        self.assertEqual(json.dumps(node.outbound, sort_keys=True), before)
+        self.assertTrue(node.outbound["streamSettings"]["tlsSettings"]["allowInsecure"])
+
+    def test_verified_tls_nodes_never_fetch_a_pin_and_drop_the_removed_key(self):
+        node = scanner.parse_node(
+            "trojan://pw@example.com:443?security=tls&sni=ok.example#t"
+        )
+        with mock.patch.object(scanner, "fetch_peer_cert_sha256") as fetch:
+            config = scanner.build_xray_config(node, 19080)
+        fetch.assert_not_called()
+        tls = config["outbounds"][0]["streamSettings"]["tlsSettings"]
+        self.assertNotIn("allowInsecure", tls)
+        self.assertNotIn("pinnedPeerCertSha256", tls)
+
+    def test_unreachable_insecure_node_is_reported_with_a_clear_error(self):
+        node = scanner.parse_node(
+            "trojan://pw@127.0.0.1:1?allowInsecure=1&sni=x.example#t"
+        )
+        with mock.patch.object(
+            scanner, "fetch_peer_cert_sha256",
+            side_effect=scanner.ScannerError("insecure TLS node: certificate unavailable (OSError)"),
+        ):
+            result = scanner.test_node(node, "xray", scanner.Settings())
+        self.assertFalse(result.passed)
+        self.assertIn("certificate unavailable", result.error)
+
+    def _patient(self, samples, previous=None):
+        settings = scanner.Settings()
+        node = scanner.parse_node(
+            f"vless://{UUID}@example.com:443?security=tls&type=tcp#patient"
+        )
+        previous = previous or scanner.TestResult(
+            node.fingerprint, False, 1, 3, None, None, 0.33,
+            "insufficient_successes", error="curl: (28) timed out",
+        )
+        session = mock.MagicMock()
+        session.__enter__.return_value = 19080
+        session.__exit__.return_value = None
+        with mock.patch.object(scanner, "XraySession", return_value=session), mock.patch.object(
+            scanner, "probe_once", side_effect=samples
+        ) as probe, mock.patch.object(
+            scanner, "detect_exit_trace", return_value=scanner.ExitTrace(None, "NL", None)
+        ):
+            result = scanner.patient_test_node(node, "xray", settings, previous)
+        self.patient_probe_calls = probe.call_count
+        return result, previous
+
+    def test_patient_stage_accepts_a_slow_node_that_answers_three_destinations(self):
+        ok = scanner.ProbeSample(True, latency_ms=5200.0)
+        bad = scanner.ProbeSample(False, reason="timed out")
+        result, previous = self._patient([bad, ok, ok, ok, ok])
+        self.assertTrue(result.passed)
+        self.assertTrue(result.patient)
+        self.assertEqual(result.reason, "ok")
+        self.assertEqual(result.exit_country, "NL")
+        self.assertEqual(self.patient_probe_calls, 4)  # stops once three answered
+
+    def test_patient_stage_still_rejects_a_node_that_stays_silent(self):
+        bad = scanner.ProbeSample(False, reason="curl: (28) timed out")
+        ok = scanner.ProbeSample(True, latency_ms=900.0)
+        result, previous = self._patient([ok, bad, bad, bad, bad])
+        self.assertIs(result, previous)
+        self.assertFalse(result.passed)
+        self.assertEqual(self.patient_probe_calls, 4)  # gave up once 3 could not happen
+
+    def test_patient_stage_rejects_beyond_the_slow_latency_limit(self):
+        slow = scanner.ProbeSample(True, latency_ms=scanner.Settings().patient_max_latency_ms + 1)
+        result, previous = self._patient([slow, slow, slow])
+        self.assertIs(result, previous)
+
+    def test_patient_stage_failure_to_start_keeps_the_original_failure(self):
+        settings = scanner.Settings()
+        node = scanner.parse_node(f"vless://{UUID}@example.com:443?security=tls&type=tcp#p")
+        previous = scanner.TestResult(
+            node.fingerprint, False, 0, 2, None, None, 0.0, "confirmed_unreachable"
+        )
+        with mock.patch.object(scanner, "XraySession", side_effect=scanner.ScannerError("x")):
+            self.assertIs(
+                scanner.patient_test_node(node, "xray", settings, previous), previous
+            )
+
+    def test_only_nodes_with_signs_of_life_get_the_patient_stage(self):
+        def failed(reason, error="", successes=0):
+            return scanner.TestResult(
+                "abc", False, successes, 3, None, None, 0.0, reason, error=error
+            )
+
+        self.assertTrue(scanner.needs_patient_retest(failed("confirmed_unreachable", "curl: (28) Connection timed out")))
+        self.assertTrue(scanner.needs_patient_retest(failed("insufficient_successes", "curl: (35) reset", successes=1)))
+        self.assertTrue(scanner.needs_patient_retest(failed("unstable_jitter", successes=4)))
+        self.assertFalse(scanner.needs_patient_retest(failed("confirmed_unreachable", "curl: (35) wrong version number")))
+        self.assertFalse(scanner.needs_patient_retest(failed("confirmed_unreachable", "ScannerError: xray failed to start")))
+        self.assertFalse(scanner.needs_patient_retest(failed("confirmed_unreachable", "tcp connect failed: TimeoutError")))
+        self.assertFalse(scanner.needs_patient_retest(failed("stream_stall", "timed out")))
+        self.assertFalse(scanner.needs_patient_retest(scanner.TestResult("a", True, 3, 3, 1.0, 1.0, 1.0, "ok")))
+
     def test_two_failed_probes_stop_the_health_test_early(self):
         samples = [scanner.ProbeSample(False, reason="curl: (28) timeout")] * 2 + [
             scanner.ProbeSample(True, latency_ms=100.0)
@@ -1313,7 +1438,7 @@ class ScannerParserTests(unittest.TestCase):
 class FullRunTests(unittest.TestCase):
     """Drive run() end to end with the network and Xray replaced by fakes."""
 
-    def _run(self, node_count, env, health=None):
+    def _run(self, node_count, env, health=None, patient=None):
         import argparse
         import os
 
@@ -1378,7 +1503,10 @@ class FullRunTests(unittest.TestCase):
                 return_value=scanner.SourceResult("feed", True, links),
             ), mock.patch.object(scanner, "test_node", health or fake_test_node), mock.patch.object(
                 scanner, "speed_test_node", fake_speed
-            ), mock.patch.object(scanner, "tcp_connect_check", fake_tcp):
+            ), mock.patch.object(scanner, "tcp_connect_check", fake_tcp), mock.patch.object(
+                scanner, "patient_test_node",
+                patient or (lambda node, xray, settings, previous: previous),
+            ):
                 self.assertEqual(scanner.run(args), 0)
             status = json.loads((output / "status.json").read_text(encoding="utf-8"))
             published = (output / "sub-raw.txt").read_text(encoding="utf-8").split()
@@ -1445,6 +1573,42 @@ class FullRunTests(unittest.TestCase):
         self.assertLess(
             configs["second_chance_recovered"], configs["second_chance_tested"]
         )
+        self.assertEqual(configs["published"], configs["passed_current"])
+
+    def test_patient_stage_recovers_slow_nodes_and_they_are_published(self):
+        def timing_out(node, xray_bin, settings):
+            number = int(node.fingerprint[:6], 16)
+            if number % 5 == 0:
+                return scanner.TestResult(
+                    node.fingerprint, False, 0, 2, None, None, 0.0,
+                    "confirmed_unreachable", error="curl: (28) Connection timed out",
+                )
+            return scanner.TestResult(
+                node.fingerprint, True, 3, 3, 250.0, 30.0, 1.0, "ok",
+                exit_country="DE", exit_ip="203.0.113.7", exit_country_name="Germany",
+            )
+
+        def slow_but_alive(node, xray_bin, settings, previous):
+            if int(node.fingerprint[6:12], 16) % 2 == 0:
+                return scanner.TestResult(
+                    node.fingerprint, True, 3, 4, 5200.0, 800.0, 0.75, "ok",
+                    patient=True, exit_country="DE", exit_ip="203.0.113.7",
+                    exit_country_name="Germany",
+                )
+            return previous
+
+        status, published, state, _calls = self._run(
+            300, {"MAX_OUTPUT": "450"}, health=timing_out, patient=slow_but_alive
+        )
+        configs = status["configs"]
+        self.assertGreater(configs["patient_tested"], 0)
+        self.assertGreater(configs["patient_recovered"], 0)
+        self.assertLess(configs["patient_recovered"], configs["patient_tested"])
+        slow_records = [r for r in state["nodes"].values() if r.get("patient")]
+        self.assertTrue(slow_records)
+        # A 5.2 s node is below the normal 3 s ceiling but still published,
+        # because it was judged by the patient stage.
+        self.assertTrue(all(r["latency_ms"] > 3000 for r in slow_records))
         self.assertEqual(configs["published"], configs["passed_current"])
 
     def test_candidate_cap_rotates_but_keeps_running(self):

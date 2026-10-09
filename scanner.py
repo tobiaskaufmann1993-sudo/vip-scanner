@@ -17,6 +17,7 @@ import argparse
 import base64
 import collections
 import concurrent.futures
+import copy
 import dataclasses
 import datetime as dt
 import hashlib
@@ -29,6 +30,7 @@ import random
 import re
 import shutil
 import socket
+import ssl
 import statistics
 import subprocess
 import tempfile
@@ -105,6 +107,12 @@ class Settings:
     tcp_retry_timeout_seconds: float = 6.0
     tcp_prefilter_seconds: float = 240.0
     health_phase_fraction: float = 0.6
+    patient_retest: bool = True
+    patient_probe_timeout_seconds: float = 10.0
+    patient_connect_timeout_seconds: float = 8.0
+    patient_attempts: int = 5
+    patient_min_successes: int = 3
+    patient_max_latency_ms: float = 8000.0
     primary_attempts: int = 3
     retest_attempts: int = 2
     probe_timeout_seconds: float = 7.0
@@ -171,6 +179,9 @@ class Settings:
             speed_workers=env_int("SPEED_WORKERS", defaults.speed_workers),
             tcp_prefilter=parse_bool(
                 os.getenv("TCP_PREFILTER"), defaults.tcp_prefilter
+            ),
+            patient_retest=parse_bool(
+                os.getenv("PATIENT_RETEST"), defaults.patient_retest
             ),
             primary_attempts=env_int("PRIMARY_ATTEMPTS", defaults.primary_attempts),
             retest_attempts=env_int("RETEST_ATTEMPTS", defaults.retest_attempts),
@@ -251,6 +262,12 @@ class Settings:
             raise ScannerError("TCP prefilter timeouts must be positive")
         if not 0.2 <= self.health_phase_fraction <= 0.9:
             raise ScannerError("health_phase_fraction must be between 0.2 and 0.9")
+        if not 2 <= self.patient_min_successes <= self.patient_attempts:
+            raise ScannerError("patient test needs 2 <= min successes <= attempts")
+        if self.patient_probe_timeout_seconds < self.patient_connect_timeout_seconds:
+            raise ScannerError("patient probe timeout must cover its connect timeout")
+        if self.patient_max_latency_ms < self.max_latency_ms:
+            raise ScannerError("PATIENT max latency must be >= MAX_LATENCY_MS")
         if self.primary_attempts < 2 or self.retest_attempts < 0:
             raise ScannerError("Probe attempt counts are invalid")
         if self.output_format not in {"base64", "raw"}:
@@ -342,6 +359,7 @@ class TestResult:
     geo_city_confident: bool = False
     exit_city_source: str | None = None
     error: str = ""
+    patient: bool = False
 
 
 @dataclasses.dataclass(slots=True)
@@ -939,7 +957,13 @@ def parse_vless_or_trojan(uri: str, protocol: str) -> Node:
         raise UnsupportedNode("missing credential")
     query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
     network = qfirst(query, "type", "network", default="tcp")
-    security = qfirst(query, "security", default="none")
+    # Trojan share links use TLS unless they say otherwise (v2rayN, sing-box
+    # and Xray clients all behave that way), and most collectors omit the
+    # ``security`` parameter entirely. Treating a missing value as plaintext
+    # made every such link fail and be rejected as unreachable.
+    security = qfirst(query, "security") or (
+        "tls" if protocol == "trojan" else "none"
+    )
     stream = make_stream_settings(network, security, query, host)
     name = urllib.parse.unquote(parsed.fragment or "").strip()
 
@@ -1222,6 +1246,59 @@ def available_local_port() -> int:
         return int(sock.getsockname()[1])
 
 
+_CERT_PIN_CACHE: dict[tuple[str, int, str], str] = {}
+_CERT_PIN_LOCK = threading.Lock()
+
+
+def fetch_peer_cert_sha256(host: str, port: int, server_name: str) -> str:
+    """Return the SHA-256 (hex) of the certificate a TLS server presents."""
+    key = (host, port, server_name)
+    with _CERT_PIN_LOCK:
+        cached = _CERT_PIN_CACHE.get(key)
+    if cached:
+        return cached
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((host, port), timeout=5.0) as raw:
+            with context.wrap_socket(raw, server_hostname=server_name or None) as tls:
+                der = tls.getpeercert(binary_form=True)
+    except Exception as exc:
+        raise ScannerError(
+            f"insecure TLS node: certificate unavailable ({type(exc).__name__})"
+        ) from exc
+    if not der:
+        raise ScannerError("insecure TLS node: certificate unavailable")
+    digest = hashlib.sha256(der).hexdigest()
+    with _CERT_PIN_LOCK:
+        _CERT_PIN_CACHE[key] = digest
+    return digest
+
+
+def xray_outbound_for_test(node: Node) -> dict[str, Any]:
+    """Return the outbound Xray should use for probing this node.
+
+    Xray 26.x removed ``allowInsecure`` and refuses to start when it is set.
+    Links that carry ``allowInsecure=1`` (typically self-signed servers) would
+    therefore always look "unreachable". For the probe only, the certificate
+    the server actually presents is pinned instead, which accepts exactly the
+    same connection ``allowInsecure`` used to. The published link is unchanged.
+    """
+    stream = node.outbound.get("streamSettings")
+    tls = stream.get("tlsSettings") if isinstance(stream, dict) else None
+    if not isinstance(tls, dict) or "allowInsecure" not in tls:
+        return node.outbound
+    outbound = copy.deepcopy(node.outbound)
+    tls = outbound["streamSettings"]["tlsSettings"]
+    insecure = bool(tls.pop("allowInsecure"))
+    if insecure:
+        tls["pinnedPeerCertSha256"] = fetch_peer_cert_sha256(
+            node.host.strip("[]"), node.port, str(tls.get("serverName", ""))
+        )
+    return outbound
+
+
 def build_xray_config(node: Node, socks_port: int) -> dict[str, Any]:
     return {
         "log": {"loglevel": "none"},
@@ -1235,7 +1312,7 @@ def build_xray_config(node: Node, socks_port: int) -> dict[str, Any]:
                 "sniffing": {"enabled": False},
             }
         ],
-        "outbounds": [node.outbound],
+        "outbounds": [xray_outbound_for_test(node)],
     }
 
 
@@ -1306,6 +1383,7 @@ def curl_measure(
     byte_range: str = "",
     low_speed_limit_bps: int = 0,
     low_speed_seconds: int = 0,
+    connect_timeout: float | None = None,
 ) -> tuple[bool, dict[str, float | int | str], str]:
     marker = "__MEZA_METRICS__"
     fmt = marker + "%{http_code}\t%{time_starttransfer}\t%{time_total}\t%{size_download}\t%{speed_download}\n"
@@ -1320,7 +1398,7 @@ def curl_measure(
         "--proxy",
         f"socks5h://127.0.0.1:{socks_port}",
         "--connect-timeout",
-        str(min(4.0, timeout)),
+        str(min(4.0 if connect_timeout is None else connect_timeout, timeout)),
         "--max-time",
         str(timeout),
         "--output",
@@ -1391,8 +1469,19 @@ def curl_measure(
     return True, metrics, ""
 
 
-def probe_once(port: int, url: str, settings: Settings) -> ProbeSample:
-    ok, metrics, reason = curl_measure(port, url, settings.probe_timeout_seconds)
+def probe_once(
+    port: int,
+    url: str,
+    settings: Settings,
+    timeout: float | None = None,
+    connect_timeout: float | None = None,
+) -> ProbeSample:
+    ok, metrics, reason = curl_measure(
+        port,
+        url,
+        settings.probe_timeout_seconds if timeout is None else timeout,
+        connect_timeout=connect_timeout,
+    )
     if not ok:
         return ProbeSample(False, reason=reason)
     return ProbeSample(
@@ -2036,6 +2125,112 @@ def test_node(node: Node, xray_bin: str, settings: Settings) -> TestResult:
         error="" if stable_enough else _short_error(last_failure),
     )
     if stable_enough and exit_geo is not None:
+        result.exit_country = exit_geo.country_code
+        result.exit_ip = exit_geo.ip
+        result.exit_country_name = exit_geo.country_name
+        result.exit_city = exit_geo.city
+        result.geo_city_confident = exit_geo.city_confident
+        result.exit_city_source = exit_geo.city_source
+    return result
+
+
+# Reasons for which a node may still be alive: the strict first-pass limits are
+# narrow (a 4 s connect timeout, at most one failed probe, 600 ms of jitter).
+PATIENT_REASONS = frozenset(
+    {
+        "confirmed_unreachable",
+        "insufficient_successes",
+        "unstable",
+        "unstable_jitter",
+        "consistently_high_latency",
+    }
+)
+_DETERMINISTIC_FAILURE_MARKERS = (
+    "xray failed to start",
+    "tcp connect failed",
+    "certificate unavailable",
+)
+
+
+def needs_patient_retest(result: TestResult) -> bool:
+    """True when a failed node shows signs of life that a stricter pass hid.
+
+    Nodes whose failure is deterministic (Xray rejects the config, nothing
+    listens on the port, the certificate cannot be fetched) are not worth
+    another attempt. A node that answered at least one probe, or only ever
+    timed out, may simply be slow.
+    """
+    if result.passed or result.reason not in PATIENT_REASONS:
+        return False
+    error = result.error.lower()
+    if any(marker in error for marker in _DETERMINISTIC_FAILURE_MARKERS):
+        return False
+    if result.success_count > 0:
+        return True
+    return "timed out" in error or "timeout" in error
+
+
+def patient_test_node(
+    node: Node, xray_bin: str, settings: Settings, previous: TestResult
+) -> TestResult:
+    """Final, slow-tolerant health check for nodes that failed the strict one.
+
+    Uses long timeouts and judges the node on distinct destinations: it passes
+    when ``patient_min_successes`` different probe URLs answered, however many
+    others failed (one destination can be unreachable from a given exit). It is
+    never used to accept a node whose median response is beyond
+    ``patient_max_latency_ms``. A failure returns ``previous`` untouched.
+    """
+    urls = list(settings.probe_urls)
+    random.Random(int(node.fingerprint[:8], 16) ^ 0x5EED).shuffle(urls)
+    urls = urls[: settings.patient_attempts]
+    needed = min(settings.patient_min_successes, len(urls))
+    samples: list[ProbeSample] = []
+    exit_geo: ExitGeo | None = None
+    try:
+        with XraySession(xray_bin, node, settings.xray_start_timeout_seconds) as port:
+            for url in urls:
+                samples.append(
+                    probe_once(
+                        port,
+                        url,
+                        settings,
+                        timeout=settings.patient_probe_timeout_seconds,
+                        connect_timeout=settings.patient_connect_timeout_seconds,
+                    )
+                )
+                successes = sum(1 for sample in samples if sample.ok)
+                failures = len(samples) - successes
+                if successes >= needed or failures > len(urls) - needed:
+                    break
+            if sum(1 for sample in samples if sample.ok) >= needed:
+                try:
+                    trace = detect_exit_trace(
+                        port, min(6.0, settings.patient_probe_timeout_seconds)
+                    )
+                    exit_geo = resolve_exit_geo(trace, settings)
+                except Exception:
+                    exit_geo = None
+    except Exception:
+        return previous
+
+    success_count, median, jitter, success_rate = summarize_samples(samples)
+    if success_count < needed or median is None:
+        return previous
+    if median > settings.patient_max_latency_ms:
+        return previous
+    result = TestResult(
+        node.fingerprint,
+        True,
+        success_count,
+        len(samples),
+        median,
+        jitter,
+        success_rate,
+        "ok",
+        patient=True,
+    )
+    if exit_geo is not None:
         result.exit_country = exit_geo.country_code
         result.exit_ip = exit_geo.ip
         result.exit_country_name = exit_geo.country_name
@@ -2836,6 +3031,7 @@ def make_record(
         "source_names": sorted(node.source_names or {node.name}),
         "source_ids": sorted(node.source_ids),
         "status": "healthy",
+        "patient": bool(result.patient),
         "last_success": now,
         "failure_streak": 0,
         "latency_ms": round(float(result.latency_ms or 0.0), 2),
@@ -3138,13 +3334,15 @@ def run(args: argparse.Namespace) -> int:
     # shared CDN / proxy-IP nodes is occasionally slow or reset, and a single
     # unlucky pass must not decide a node's fate. A node is rejected only when
     # two independent full tests both fail; one full pass is still required.
-    recoverable_reasons = {"confirmed_unreachable", "insufficient_successes", "unstable"}
+    recoverable_reasons = set(PATIENT_REASONS)
     retry_nodes = [
         node
         for node in ordered_nodes
         if node.fingerprint in results
         and not results[node.fingerprint].passed
         and results[node.fingerprint].reason in recoverable_reasons
+        # Xray refusing the config is deterministic; a retest cannot change it.
+        and not results[node.fingerprint].error.endswith("xray failed to start")
     ]
     recovered = 0
     if retry_nodes and time.monotonic() < health_deadline:
@@ -3159,6 +3357,8 @@ def run(args: argparse.Namespace) -> int:
                 if again.passed:
                     results[again.fingerprint] = again
                     recovered += 1
+                elif again.success_count > results[again.fingerprint].success_count:
+                    results[again.fingerprint] = again  # keep the more informative failure
                 if time.monotonic() >= health_deadline:
                     for item in second:
                         item.cancel()
@@ -3175,6 +3375,48 @@ def run(args: argparse.Namespace) -> int:
                     results[node.fingerprint] = again
                     recovered += 1
         log(f"Second chance recovered {recovered} of {len(retry_nodes)} configs.")
+
+    # Last stage: a patient pass for nodes that failed twice but show signs of
+    # life (answered a probe, or only timed out). They are judged on distinct
+    # destinations with long timeouts, so a slow or partly filtered exit is not
+    # mistaken for a dead one. A node that stays silent is rejected.
+    patient_candidates = [
+        node
+        for node in ordered_nodes
+        if node.fingerprint in results and needs_patient_retest(results[node.fingerprint])
+    ]
+    patient_recovered = 0
+    if settings.patient_retest and patient_candidates and time.monotonic() < health_deadline:
+        log(f"Patient health test for {len(patient_candidates)} configs...")
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=settings.scan_workers)
+        patient_futures: dict[concurrent.futures.Future[TestResult], Node] = {}
+        try:
+            for node in patient_candidates:
+                future = executor.submit(
+                    patient_test_node, node, xray_bin, settings, results[node.fingerprint]
+                )
+                patient_futures[future] = node
+            for future in concurrent.futures.as_completed(patient_futures):
+                outcome = future.result()
+                if outcome.passed and not results[outcome.fingerprint].passed:
+                    results[outcome.fingerprint] = outcome
+                    patient_recovered += 1
+                if time.monotonic() >= health_deadline:
+                    for item in patient_futures:
+                        item.cancel()
+                    break
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+        for future, node in patient_futures.items():
+            if future.done() and not future.cancelled():
+                try:
+                    outcome = future.result()
+                except Exception:
+                    continue
+                if outcome.passed and not results[node.fingerprint].passed:
+                    results[node.fingerprint] = outcome
+                    patient_recovered += 1
+        log(f"Patient test recovered {patient_recovered} of {len(patient_candidates)} configs.")
     health_not_tested = max(
         0, health_scheduled - sum(1 for node in ordered_nodes if node.fingerprint in results)
     )
@@ -3482,7 +3724,12 @@ def run(args: argparse.Namespace) -> int:
     viable_records = [
         record
         for record in current_records.values()
-        if float(record.get("latency_ms") or 99_999) <= settings.max_latency_ms
+        if float(record.get("latency_ms") or 99_999)
+        <= (
+            settings.patient_max_latency_ms
+            if record.get("patient")
+            else settings.max_latency_ms
+        )
     ]
     unknown_country_fingerprints = {
         str(record.get("fingerprint", ""))
@@ -3635,6 +3882,8 @@ def run(args: argparse.Namespace) -> int:
             "tcp_prefilter_rejected": tcp_rejected,
             "second_chance_tested": len(retry_nodes),
             "second_chance_recovered": recovered,
+            "patient_tested": len(patient_candidates),
+            "patient_recovered": patient_recovered,
             "health_not_tested": health_not_tested,
             "candidate_limit_reached": candidate_limit_reached,
         },
@@ -3767,7 +4016,60 @@ def run(args: argparse.Namespace) -> int:
         server_ids,
     )
     log(f"Published {len(selected)} configs to {output_dir / 'sub.txt'}")
+    if getattr(args, "diagnostics_file", None):
+        write_rejection_diagnostics(
+            Path(args.diagnostics_file),
+            nodes,
+            results,
+            {node.fingerprint for node in retry_nodes},
+            set(published_records),
+        )
     return 0
+
+
+def write_rejection_diagnostics(
+    path: Path,
+    nodes: dict[str, Node],
+    results: dict[str, TestResult],
+    second_chance: set[str],
+    published: set[str],
+) -> None:
+    """Write one anonymous line per rejected node so a rejection can be traced.
+
+    Hosts, credentials and links are deliberately left out (the file is meant
+    for a workflow artifact, and some feeds are private). The fingerprint lets
+    the owner match a line to a config from a feed they can read.
+    """
+    rows: list[dict[str, Any]] = []
+    for fingerprint, node in nodes.items():
+        if fingerprint in published:
+            continue
+        result = results.get(fingerprint)
+        stream = node.outbound.get("streamSettings") or {}
+        rows.append(
+            {
+                "fingerprint": fingerprint,
+                "sources": sorted(node.source_ids),
+                "protocol": node.protocol,
+                "network": stream.get("network", "-"),
+                "security": stream.get("security", "-"),
+                "port": node.port,
+                "tested": result is not None,
+                "reason": result.reason if result is not None else "not_tested",
+                "error": result.error if result is not None else "",
+                "successes": result.success_count if result is not None else 0,
+                "attempts": result.attempt_count if result is not None else 0,
+                "tcp_prefilter": bool(
+                    result is not None and result.error.startswith("tcp connect failed")
+                ),
+                "second_chance": fingerprint in second_chance,
+            }
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(rows, ensure_ascii=False, separators=(",", ":")), encoding="utf-8"
+    )
+    log(f"Wrote {len(rows)} rejection diagnostics to {path}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3778,6 +4080,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--previous-state-url",
         default=os.getenv("PREVIOUS_STATE_URL", "") or None,
         help="Existing public state.json URL used for graceful retention",
+    )
+    parser.add_argument(
+        "--diagnostics-file",
+        default=None,
+        help="Optional JSON file listing every rejected node (no hosts or links)",
     )
     return parser
 

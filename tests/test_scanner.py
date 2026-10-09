@@ -23,8 +23,12 @@ class ScannerParserTests(unittest.TestCase):
         session.__exit__.return_value = None
         with mock.patch.object(scanner, "XraySession", return_value=session), mock.patch.object(
             scanner, "probe_once", side_effect=samples
+        ) as probe, mock.patch.object(
+            scanner, "detect_exit_trace", return_value=scanner.ExitTrace(None, "DE", None)
         ):
-            return scanner.test_node(node, "xray", settings)
+            result = scanner.test_node(node, "xray", settings)
+        self.probe_calls = probe.call_count
+        return result
 
     def test_vless_ws_tls(self):
         uri = (
@@ -696,8 +700,10 @@ class ScannerParserTests(unittest.TestCase):
         self.assertEqual(settings.min_speed_mbps, 1.1)
         self.assertEqual(settings.good_speed_mbps, 1.5)
         self.assertEqual(settings.strong_speed_mbps, 2.5)
-        self.assertEqual(settings.speed_budget_bytes, 96 * 1024 * 1024)
-        self.assertEqual(settings.speed_retry_reserve_bytes, 12 * 1024 * 1024)
+        self.assertEqual(settings.speed_budget_bytes, 160 * 1024 * 1024)
+        self.assertEqual(settings.speed_retry_reserve_bytes, 24 * 1024 * 1024)
+        self.assertGreaterEqual(settings.max_configs, 6000)
+        self.assertTrue(settings.tcp_prefilter)
         self.assertEqual(settings.geo_city_max_distance_km, 80.0)
         self.assertEqual(
             settings.geonames_cities_path, ".cache/geoip/cities15000.txt"
@@ -772,29 +778,75 @@ class ScannerParserTests(unittest.TestCase):
         self.assertTrue(result.passed)
         self.assertEqual(result.stream_quality, "unverified")
 
-    def test_unverified_new_node_is_not_published(self):
+    def test_untested_healthy_node_is_published_provisionally(self):
+        # A node that passed the real HTTPS health probes must not be rejected
+        # merely because the transfer-test budget ran out before its turn.
         result = scanner.TestResult("abc", True, 3, 3, 200.0, 20.0, 1.0, "ok")
         scanner.apply_stream_result(result, None, None, scanner.Settings())
-        self.assertFalse(result.passed)
-        self.assertEqual(result.reason, "stream_unverified")
+        self.assertTrue(result.passed)
+        self.assertEqual(result.stream_quality, "unverified")
 
-    def test_unverified_previous_node_gets_only_one_provisional_scan(self):
+    def test_inconclusive_transfer_is_provisional_for_a_limited_time(self):
+        inconclusive = scanner.StreamTestResult(
+            None, [], None, 1, 0, 0, 0, False,
+            "unverified", False, "stream_unverified", None,
+        )
+        for streak in range(scanner.INCONCLUSIVE_STREAM_LIMIT):
+            result = scanner.TestResult("abc", True, 3, 3, 200.0, 20.0, 1.0, "ok")
+            scanner.apply_stream_result(
+                result, inconclusive, {"stream_uncertain_streak": streak},
+                scanner.Settings(),
+            )
+            self.assertTrue(result.passed, streak)
+
         result = scanner.TestResult("abc", True, 3, 3, 200.0, 20.0, 1.0, "ok")
         scanner.apply_stream_result(
             result,
-            scanner.StreamTestResult(
-                None, [], None, 1, 0, 0, 0, False,
-                "unverified", False, "stream_unverified", None,
-            ),
+            inconclusive,
             {
                 "stream_quality": "strong",
                 "stream_verified": True,
-                "stream_uncertain_streak": 1,
+                "stream_uncertain_streak": scanner.INCONCLUSIVE_STREAM_LIMIT,
             },
             scanner.Settings(),
         )
         self.assertFalse(result.passed)
         self.assertEqual(result.reason, "stream_unverified")
+
+    def test_stream_geo_does_not_erase_health_phase_geo(self):
+        result = scanner.TestResult(
+            "abc", True, 3, 3, 200.0, 20.0, 1.0, "ok",
+            exit_country="DE", exit_ip="203.0.113.9",
+        )
+        scanner.apply_stream_result(
+            result,
+            scanner.StreamTestResult(
+                3.0, [3.0], 3.0, 1, 1, 0, 262144, False,
+                "strong", False, "ok", None,
+            ),
+            None,
+            scanner.Settings(),
+        )
+        self.assertEqual(result.exit_country, "DE")
+        self.assertEqual(result.exit_ip, "203.0.113.9")
+
+    def test_uncertain_streak_counts_only_attempted_transfers(self):
+        settings = scanner.Settings()
+        node = scanner.parse_node(
+            f"vless://{UUID}@example.com:443?security=tls&type=tcp#streak"
+        )
+        skipped = scanner.TestResult(node.fingerprint, True, 3, 3, 200.0, 20.0, 1.0, "ok")
+        record = scanner.make_record(
+            node, skipped, "2026-07-26T12:00:00Z",
+            {"stream_uncertain_streak": 2}, settings,
+        )
+        self.assertEqual(record["stream_uncertain_streak"], 2)
+        tried = dataclasses.replace(skipped, stream_attempts=1)
+        record = scanner.make_record(
+            node, tried, "2026-07-26T12:00:00Z",
+            {"stream_uncertain_streak": 2}, settings,
+        )
+        self.assertEqual(record["stream_uncertain_streak"], 3)
 
     def test_one_weak_sample_gets_one_chance_but_not_indefinitely(self):
         stream = scanner.StreamTestResult(
@@ -1089,6 +1141,284 @@ class ScannerParserTests(unittest.TestCase):
         )
         self.assertFalse(result.passed)
         self.assertEqual(result.reason, "unstable_jitter")
+
+    def test_two_failed_probes_stop_the_health_test_early(self):
+        samples = [scanner.ProbeSample(False, reason="curl: (28) timeout")] * 2 + [
+            scanner.ProbeSample(True, latency_ms=100.0)
+        ] * 3
+        result = self._test_result_for_samples(samples)
+        self.assertFalse(result.passed)
+        self.assertEqual(self.probe_calls, 2)
+        self.assertEqual(result.reason, "confirmed_unreachable")
+        self.assertIn("timeout", result.error)
+
+    def test_one_failed_probe_is_still_recovered_by_retest(self):
+        samples = [
+            scanner.ProbeSample(False, reason="curl: (28) timeout"),
+            *[scanner.ProbeSample(True, latency_ms=100.0)] * 4,
+        ]
+        result = self._test_result_for_samples(samples)
+        self.assertTrue(result.passed)
+        self.assertEqual(self.probe_calls, 5)
+
+    def test_health_pass_records_egress_country_for_naming(self):
+        result = self._test_result_for_samples(
+            [scanner.ProbeSample(True, latency_ms=100.0)] * 3
+        )
+        self.assertTrue(result.passed)
+        self.assertEqual(result.exit_country, "DE")  # country from the trace alone
+        with mock.patch.object(
+            scanner,
+            "resolve_exit_geo",
+            return_value=scanner.ExitGeo("203.0.113.5", "NL", "Netherlands", None, False),
+        ):
+            result = self._test_result_for_samples(
+                [scanner.ProbeSample(True, latency_ms=100.0)] * 3
+            )
+        self.assertEqual(result.exit_country, "NL")
+        self.assertEqual(result.exit_ip, "203.0.113.5")
+
+    def test_percent_encoded_query_value_does_not_corrupt_the_link(self):
+        # ``ech=...%2Budp%3A%2F%2F...`` contains an encoded "://" inside a
+        # query value. The link itself must be kept byte-for-byte.
+        link = (
+            f"vless://{UUID}@188.114.97.6:443?encryption=none&security=tls"
+            "&sni=a.example&fp=chrome&alpn=http%2F1.1"
+            "&ech=cloudflare-ech.com%2Budp%3A%2F%2F1.1.1.1&type=ws&host=a.example"
+            "&path=%2Fcart%2Fproxyip%3D1.2.3.4%3Fed%23Telegram---tag#NAME"
+        )
+        links = scanner.extract_links(link)
+        self.assertEqual(links, [link])
+        path = scanner.parse_node(links[0]).outbound["streamSettings"]["wsSettings"]["path"]
+        self.assertEqual(path, "/cart/proxyip=1.2.3.4?ed#Telegram---tag")
+
+    def test_fully_encoded_embedded_link_is_still_decoded(self):
+        inner = f"vless://{UUID}@example.com:443?security=tls&type=tcp#E"
+        wrapped = "https://t.me/proxy?url=" + inner.replace(":", "%3A").replace("/", "%2F")
+        self.assertEqual(scanner.extract_links(wrapped), [inner])
+        self.assertEqual(
+            scanner.extract_links(inner.replace(":", "%3A").replace("/", "%2F")),
+            [inner],
+        )
+
+    def test_links_differing_only_in_path_stay_distinct(self):
+        base = (
+            f"vless://{UUID}@188.114.97.6:443?security=tls&sni=a.example"
+            "&ech=x.example%2Budp%3A%2F%2F1.1.1.1&type=ws&host=a.example&path="
+        )
+        first = scanner.extract_links(base + "%2Fp%3Fed%23one#A")[0]
+        second = scanner.extract_links(base + "%2Fp%3Fed%23two#B")[0]
+        self.assertNotEqual(
+            scanner.parse_node(first).fingerprint,
+            scanner.parse_node(second).fingerprint,
+        )
+
+    def test_rotation_changes_between_windows_and_is_stable_inside_one(self):
+        fingerprints = [f"{index:04x}" for index in range(200)]
+        first = sorted(fingerprints, key=lambda item: scanner.rotation_key(item, 1))
+        again = sorted(fingerprints, key=lambda item: scanner.rotation_key(item, 1))
+        later = sorted(fingerprints, key=lambda item: scanner.rotation_key(item, 2))
+        self.assertEqual(first, again)
+        self.assertNotEqual(first, later)
+        # Over a few windows every node reaches the first quarter at least once.
+        seen = set()
+        for salt in range(40):
+            ordered = sorted(fingerprints, key=lambda item: scanner.rotation_key(item, salt))
+            seen.update(ordered[:50])
+        self.assertEqual(seen, set(fingerprints))
+        self.assertEqual(scanner.rotation_salt(0), 0)
+        self.assertEqual(
+            scanner.rotation_salt(scanner.ROTATION_WINDOW_SECONDS * 3 + 1), 3
+        )
+
+    def test_retry_plan_uses_actual_primary_bytes(self):
+        settings = scanner.Settings()
+        primary = scanner.initial_stream_test_count(1000, settings)
+        planned_retry, _, _ = scanner.followup_stream_test_plan(primary, 1000, settings)
+        used_retry, deep, planned = scanner.followup_stream_test_plan(
+            primary, 1000, settings, primary_used_bytes=primary * 40_000
+        )
+        self.assertGreater(used_retry, planned_retry)
+        self.assertLessEqual(planned, settings.speed_budget_bytes)
+        self.assertLessEqual(
+            primary * settings.speed_test_bytes, settings.speed_budget_bytes
+        )
+        # Reported actual bytes can never raise the plan above the cap.
+        capped_retry, _, capped_planned = scanner.followup_stream_test_plan(
+            primary, 1000, settings, primary_used_bytes=10**12
+        )
+        self.assertEqual(capped_retry, planned_retry)
+        self.assertLessEqual(capped_planned, settings.speed_budget_bytes)
+
+    def test_node_uses_tcp_detection(self):
+        tcp = scanner.parse_node(f"vless://{UUID}@example.com:443?security=tls&type=ws&path=%2F#a")
+        kcp = scanner.parse_node(f"vless://{UUID}@example.com:443?security=none&type=kcp#b")
+        h3 = scanner.parse_node(
+            f"vless://{UUID}@example.com:443?security=tls&type=xhttp&alpn=h3&path=%2F#c"
+        )
+        ss = scanner.parse_node(
+            "ss://" + base64.urlsafe_b64encode(b"aes-256-gcm:pw").decode().rstrip("=")
+            + "@example.com:8388#d"
+        )
+        self.assertTrue(scanner.node_uses_tcp(tcp))
+        self.assertFalse(scanner.node_uses_tcp(kcp))
+        self.assertFalse(scanner.node_uses_tcp(h3))
+        self.assertTrue(scanner.node_uses_tcp(ss))
+
+    def test_tcp_prefilter_rejects_only_confirmed_dead_endpoints(self):
+        import socket
+
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.bind(("127.0.0.1", 0))
+        server.listen(8)
+        live_port = server.getsockname()[1]
+        dead = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
+        dead.close()  # nothing listens here any more
+        try:
+            def make(port, tag):
+                return scanner.parse_node(
+                    f"vless://{UUID}@127.0.0.1:{port}?security=tls&type=ws&path=%2F{tag}#{tag}"
+                )
+
+            alive_node = make(live_port, "alive")
+            dead_node = make(dead_port, "dead")
+            protected_node = make(dead_port, "protected")
+            udp_node = scanner.parse_node(
+                f"vless://{UUID}@127.0.0.1:{dead_port}?security=none&type=kcp#udp"
+            )
+            settings = dataclasses.replace(
+                scanner.Settings(),
+                tcp_connect_timeout_seconds=1.0,
+                tcp_retry_timeout_seconds=1.0,
+            )
+            failed, checked = scanner.tcp_prefilter(
+                [alive_node, dead_node, protected_node, udp_node],
+                {protected_node.fingerprint},
+                settings,
+            )
+        finally:
+            server.close()
+        self.assertEqual(set(failed), {dead_node.fingerprint})
+        self.assertEqual(checked, 2)
+
+
+class FullRunTests(unittest.TestCase):
+    """Drive run() end to end with the network and Xray replaced by fakes."""
+
+    def _run(self, node_count, env):
+        import argparse
+        import os
+
+        links = []
+        for index in range(node_count):
+            links.append(
+                f"vless://{UUID}@10.0.{index // 250}.{index % 250 + 1}:{4000 + index}"
+                f"?security=tls&type=ws&sni=a.example&host=a.example"
+                f"&ech=x.example%2Budp%3A%2F%2F1.1.1.1&path=%2Fp{index}%3Fed%23tag{index}"
+                f"#raw-{index}"
+            )
+
+        def fake_test_node(node, xray_bin, settings):
+            number = int(node.fingerprint[:6], 16)
+            if number % 3 == 0:
+                return scanner.TestResult(
+                    node.fingerprint, False, 0, 2, None, None, 0.0,
+                    "confirmed_unreachable", error="curl: (28) timed out",
+                )
+            return scanner.TestResult(
+                node.fingerprint, True, 3, 3, 250.0, 30.0, 1.0, "ok",
+                exit_country="DE", exit_ip="203.0.113.7",
+                exit_country_name="Germany",
+            )
+
+        calls = {"primary": 0, "retry": 0}
+
+        def fake_speed(node, xray_bin, settings, deep_test=False,
+                       endpoint_url=None, use_range=False, include_quick=True):
+            if endpoint_url:  # independent OVH retry always succeeds
+                calls["retry"] += 1
+                return scanner.StreamTestResult(
+                    3.0, [3.0], 3.0, 1, 1, 0, 262144, False, "strong", False, "ok",
+                    "DE", "203.0.113.7", "Germany",
+                )
+            calls["primary"] += 1
+            number = int(node.fingerprint[6:12], 16)
+            if number % 2 == 0:  # primary Cloudflare endpoint unreachable
+                return scanner.StreamTestResult(
+                    None, [], None, 1, 0, 0, 0, False, "unverified", False,
+                    "stream_unverified", None,
+                )
+            return scanner.StreamTestResult(
+                3.0, [3.0], 3.0, 1, 1, 0, 262144, False, "strong", False, "ok",
+                "DE", "203.0.113.7", "Germany",
+            )
+
+        def fake_tcp(host, port, timeout):
+            return "TimeoutError" if port % 5 == 0 else ""
+
+        with tempfile.TemporaryDirectory() as directory:
+            fake_xray = Path(directory) / "xray"
+            fake_xray.write_text("#!/bin/sh\n")
+            fake_xray.chmod(0o755)
+            output = Path(directory) / "public"
+            args = argparse.Namespace(
+                xray=str(fake_xray), output_dir=str(output), previous_state_url=None
+            )
+            environment = {"SUB_URLS": "https://feed.example/list", **env}
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
+                scanner, "fetch_source",
+                return_value=scanner.SourceResult("feed", True, links),
+            ), mock.patch.object(scanner, "test_node", fake_test_node), mock.patch.object(
+                scanner, "speed_test_node", fake_speed
+            ), mock.patch.object(scanner, "tcp_connect_check", fake_tcp):
+                self.assertEqual(scanner.run(args), 0)
+            status = json.loads((output / "status.json").read_text(encoding="utf-8"))
+            published = (output / "sub-raw.txt").read_text(encoding="utf-8").split()
+            state = json.loads((output / "state.json").read_text(encoding="utf-8"))
+        return status, published, state, calls
+
+    def test_every_candidate_is_tested_and_healthy_nodes_are_not_dropped(self):
+        status, published, state, calls = self._run(
+            400, {"MAX_OUTPUT": "450", "MAX_CONFIGS": "6000"}
+        )
+        configs = status["configs"]
+        self.assertEqual(configs["unique_supported"], 400)
+        self.assertEqual(configs["tested"], 400)
+        self.assertGreater(configs["tcp_prefilter_rejected"], 0)
+        self.assertEqual(configs["health_not_tested"], 0)
+        # Healthy nodes are published whether or not the first endpoint worked.
+        self.assertEqual(configs["published"], configs["passed_current"])
+        self.assertEqual(len(published), configs["published"])
+        self.assertGreater(calls["retry"], 0)
+        self.assertLessEqual(
+            status["stream_test"]["planned_bytes"],
+            status["stream_test"]["budget_bytes"],
+        )
+        self.assertEqual(status["broken"]["stream_unverified"], 0)
+        self.assertTrue(status["broken"]["top_errors"])
+        self.assertTrue(all("%23" in link for link in published[:5]))
+        self.assertTrue(all(" " not in link for link in published))
+        self.assertEqual(state["scanner_version"], scanner.SCANNER_VERSION)
+
+    def test_nodes_beyond_the_transfer_budget_are_published_provisionally(self):
+        status, published, _state, calls = self._run(
+            400, {"SPEED_TEST_MAX": "40", "MAX_OUTPUT": "450"}
+        )
+        configs = status["configs"]
+        self.assertLessEqual(calls["primary"], 40)
+        self.assertGreater(configs["passed_current"], 40)
+        self.assertEqual(configs["published"], configs["passed_current"])
+        self.assertGreater(configs["provisional_published"], 0)
+        self.assertEqual(status["broken"]["stream_unverified"], 0)
+
+    def test_candidate_cap_rotates_but_keeps_running(self):
+        status, _published, _state, _calls = self._run(
+            400, {"MAX_CONFIGS": "100", "MAX_OUTPUT": "450"}
+        )
+        self.assertTrue(status["configs"]["candidate_limit_reached"])
+        self.assertEqual(status["configs"]["unique_supported"], 100)
 
 
 if __name__ == "__main__":

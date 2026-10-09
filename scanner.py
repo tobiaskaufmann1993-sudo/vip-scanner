@@ -42,7 +42,15 @@ from pathlib import Path
 from typing import Any, Iterable
 
 SUPPORTED_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://")
-SCANNER_VERSION = "1.5.0"
+ENCODED_SCHEME_RE = re.compile(r"(?i)(?:vless|vmess|trojan|ss)%3A%2F%2F")
+SCANNER_VERSION = "1.6.0"
+# Candidate rotation changes once per scan window (the workflow gates full
+# scans to roughly this interval), so no node is permanently left untested.
+ROTATION_WINDOW_SECONDS = 1_500
+# A healthy node whose transfer test stayed inconclusive (no endpoint could
+# finish a transfer, no stall seen) is published provisionally for at most this
+# many consecutive tested scans before it is treated as broken.
+INCONCLUSIVE_STREAM_LIMIT = 3
 UTC = dt.timezone.utc
 EXIT_IP_FALLBACK_URLS = (
     "https://api64.ipify.org",
@@ -87,19 +95,26 @@ class Settings:
     max_latency_ms: float = 3000.0
     max_jitter_ms: float = 600.0
     max_output: int = 450
-    max_configs: int = 1800
+    max_configs: int = 6000
     scan_workers: int = 20
     speed_workers: int = 6
+    tcp_prefilter: bool = True
+    tcp_workers: int = 128
+    tcp_connect_timeout_seconds: float = 4.0
+    tcp_retry_workers: int = 48
+    tcp_retry_timeout_seconds: float = 6.0
+    tcp_prefilter_seconds: float = 240.0
+    health_phase_fraction: float = 0.6
     primary_attempts: int = 3
     retest_attempts: int = 2
     probe_timeout_seconds: float = 7.0
     xray_start_timeout_seconds: float = 4.0
     source_timeout_seconds: float = 25.0
-    speed_test_max: int = 450
+    speed_test_max: int = 700
     speed_test_bytes: int = 262_144
     stream_test_bytes: int = 1_048_576
-    speed_budget_bytes: int = 100_663_296
-    speed_retry_reserve_bytes: int = 12_582_912
+    speed_budget_bytes: int = 167_772_160
+    speed_retry_reserve_bytes: int = 25_165_824
     min_speed_mbps: float = 1.1
     good_speed_mbps: float = 1.5
     strong_speed_mbps: float = 2.5
@@ -150,6 +165,9 @@ class Settings:
             max_configs=env_int("MAX_CONFIGS", defaults.max_configs),
             scan_workers=env_int("SCAN_WORKERS", defaults.scan_workers),
             speed_workers=env_int("SPEED_WORKERS", defaults.speed_workers),
+            tcp_prefilter=parse_bool(
+                os.getenv("TCP_PREFILTER"), defaults.tcp_prefilter
+            ),
             primary_attempts=env_int("PRIMARY_ATTEMPTS", defaults.primary_attempts),
             retest_attempts=env_int("RETEST_ATTEMPTS", defaults.retest_attempts),
             probe_timeout_seconds=env_float(
@@ -223,6 +241,12 @@ class Settings:
             raise ScannerError("SCAN_WORKERS must be between 1 and 50")
         if not 1 <= self.speed_workers <= 20:
             raise ScannerError("SPEED_WORKERS must be between 1 and 20")
+        if not 1 <= self.tcp_workers <= 512 or not 1 <= self.tcp_retry_workers <= 512:
+            raise ScannerError("TCP prefilter worker counts must be between 1 and 512")
+        if self.tcp_connect_timeout_seconds <= 0 or self.tcp_retry_timeout_seconds <= 0:
+            raise ScannerError("TCP prefilter timeouts must be positive")
+        if not 0.2 <= self.health_phase_fraction <= 0.9:
+            raise ScannerError("health_phase_fraction must be between 0.2 and 0.9")
         if self.primary_attempts < 2 or self.retest_attempts < 0:
             raise ScannerError("Probe attempt counts are invalid")
         if self.output_format not in {"base64", "raw"}:
@@ -313,6 +337,7 @@ class TestResult:
     exit_city: str | None = None
     geo_city_confident: bool = False
     exit_city_source: str | None = None
+    error: str = ""
 
 
 @dataclasses.dataclass(slots=True)
@@ -707,8 +732,17 @@ def extract_links(text: str) -> list[str]:
         # query separators escaped (``&amp;``).  Without unescaping first, every
         # parameter after the first one becomes part of the previous value and
         # Xray is built with the wrong transport/TLS settings.
-        value = html.unescape(value)
-        if "%3A%2F%2F" in value.upper():
+        if "&amp;" in value.lower():
+            value = html.unescape(value)
+        # Decode the whole line only when the share-link scheme itself is
+        # percent-encoded (for example a link embedded in a redirect URL). A
+        # normal link may legitimately contain ``%3A%2F%2F`` inside a query
+        # value such as ``ech=cloudflare-ech.com%2Budp%3A%2F%2F1.1.1.1``;
+        # decoding that would corrupt every other escaped value (``%23`` in a
+        # path would become a fragment separator).
+        if not value.lower().startswith(SUPPORTED_SCHEMES) and ENCODED_SCHEME_RE.search(
+            value
+        ):
             value = urllib.parse.unquote(value)
         lower = value.lower()
         if lower.startswith(SUPPORTED_SCHEMES):
@@ -1074,6 +1108,108 @@ def load_previous_state(url: str | None, timeout: float) -> dict[str, Any]:
     except Exception:
         pass
     return {}
+
+
+def rotation_salt(now: float | None = None) -> int:
+    """Return a value that changes once per scan window."""
+    stamp = time.time() if now is None else now
+    return int(stamp // ROTATION_WINDOW_SECONDS)
+
+
+def rotation_key(fingerprint: str, salt: int) -> str:
+    """Stable per-window pseudo-random order, so no node is always last."""
+    return hashlib.sha256(f"{salt}:{fingerprint}".encode("ascii")).hexdigest()
+
+
+def node_uses_tcp(node: Node) -> bool:
+    """True when reaching the node requires an ordinary TCP connection."""
+    stream = node.outbound.get("streamSettings")
+    if not isinstance(stream, dict):
+        return True  # Shadowsocks outbound without stream settings
+    network = str(stream.get("network", "raw"))
+    if network in {"mkcp", "quic"}:
+        return False
+    tls = stream.get("tlsSettings")
+    alpn = tls.get("alpn", []) if isinstance(tls, dict) else []
+    if network == "xhttp" and any(str(item).lower() == "h3" for item in alpn):
+        return False  # HTTP/3 runs over UDP
+    return True
+
+
+def tcp_connect_check(host: str, port: int, timeout: float) -> str:
+    """Return ``""`` when a TCP connection opens, else a short error label."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return ""
+    except OSError as exc:
+        return type(exc).__name__
+    except Exception as exc:  # pragma: no cover - defensive
+        return type(exc).__name__
+
+
+def tcp_prefilter(
+    nodes: Iterable[Node], protected: set[str], settings: Settings
+) -> tuple[dict[str, str], int]:
+    """Find nodes whose server never accepts a TCP connection.
+
+    A TCP-based node cannot work through Xray when its endpoint never opens a
+    connection, so such nodes skip the expensive Xray/curl health test. The
+    check is deliberately conservative: an endpoint must fail two independent
+    sweeps (the second at lower concurrency and with a longer timeout), nodes
+    that are currently published are never skipped, UDP transports are exempt,
+    and anything still unfinished when the time budget ends is tested normally.
+    Returns ({fingerprint: error label}, number of endpoints checked).
+    """
+    endpoints: dict[tuple[str, int], list[str]] = {}
+    for node in nodes:
+        if node.fingerprint in protected or not node_uses_tcp(node):
+            continue
+        host = node.host.strip("[]")
+        if host:
+            endpoints.setdefault((host, node.port), []).append(node.fingerprint)
+    if not endpoints:
+        return {}, 0
+
+    deadline = time.monotonic() + settings.tcp_prefilter_seconds
+
+    def sweep(
+        items: list[tuple[str, int]], workers: int, timeout: float
+    ) -> dict[tuple[str, int], str]:
+        failures: dict[tuple[str, int], str] = {}
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+        futures = {
+            executor.submit(tcp_connect_check, host, port, timeout): (host, port)
+            for host, port in items
+        }
+        try:
+            for future in concurrent.futures.as_completed(
+                futures, timeout=max(1.0, deadline - time.monotonic())
+            ):
+                label = future.result()
+                if label:
+                    failures[futures[future]] = label
+        except concurrent.futures.TimeoutError:
+            pass  # unfinished endpoints are not treated as failures
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+        return failures
+
+    first = sweep(
+        list(endpoints), settings.tcp_workers, settings.tcp_connect_timeout_seconds
+    )
+    confirmed: dict[tuple[str, int], str] = {}
+    if first and time.monotonic() < deadline:
+        second = sweep(
+            list(first),
+            settings.tcp_retry_workers,
+            settings.tcp_retry_timeout_seconds,
+        )
+        confirmed = {endpoint: second[endpoint] for endpoint in second}
+    failed: dict[str, str] = {}
+    for endpoint, label in confirmed.items():
+        for fingerprint in endpoints[endpoint]:
+            failed[fingerprint] = label
+    return failed, len(endpoints)
 
 
 def available_local_port() -> int:
@@ -1793,8 +1929,18 @@ def summarize_samples(samples: list[ProbeSample]) -> tuple[int, float | None, fl
     return success_count, float(median), float(jitter), success_rate
 
 
+def _failure_count(samples: list[ProbeSample]) -> int:
+    return sum(1 for sample in samples if not sample.ok)
+
+
+def _short_error(text: str) -> str:
+    cleaned = " ".join(str(text).split())
+    return cleaned[:120]
+
+
 def test_node(node: Node, xray_bin: str, settings: Settings) -> TestResult:
     samples: list[ProbeSample] = []
+    exit_geo: ExitGeo | None = None
     try:
         with XraySession(xray_bin, node, settings.xray_start_timeout_seconds) as port:
             seed = int(node.fingerprint[:8], 16)
@@ -1802,6 +1948,11 @@ def test_node(node: Node, xray_bin: str, settings: Settings) -> TestResult:
             random.Random(seed).shuffle(urls)
             for index in range(settings.primary_attempts):
                 samples.append(probe_once(port, urls[index % len(urls)], settings))
+                # A node needs at most one failed probe to stay viable (see the
+                # ``failures > 1`` rule below). Two failures can no longer be
+                # recovered by later probes, so stop spending time on it.
+                if _failure_count(samples) >= 2:
+                    break
 
             success_count, median, jitter, success_rate = summarize_samples(samples)
             needs_retest = (
@@ -1810,7 +1961,7 @@ def test_node(node: Node, xray_bin: str, settings: Settings) -> TestResult:
                 or median > settings.elite_latency_ms
                 or (jitter is not None and jitter > settings.max_jitter_ms * 0.6)
             )
-            if needs_retest:
+            if needs_retest and _failure_count(samples) < 2:
                 for index in range(settings.retest_attempts):
                     samples.append(
                         probe_once(
@@ -1819,6 +1970,23 @@ def test_node(node: Node, xray_bin: str, settings: Settings) -> TestResult:
                             settings,
                         )
                     )
+                    if _failure_count(samples) >= 2:
+                        break
+
+            # Resolve the real egress location while the tunnel is already up,
+            # so a healthy node can be named even if its speed test is skipped.
+            if (
+                _failure_count(samples) < 2
+                and sum(1 for sample in samples if sample.ok)
+                >= settings.primary_attempts
+            ):
+                try:
+                    trace = detect_exit_trace(
+                        port, min(6.0, settings.probe_timeout_seconds)
+                    )
+                    exit_geo = resolve_exit_geo(trace, settings)
+                except Exception:
+                    exit_geo = None
     except Exception as exc:
         return TestResult(
             node.fingerprint,
@@ -1829,6 +1997,7 @@ def test_node(node: Node, xray_bin: str, settings: Settings) -> TestResult:
             None,
             0.0,
             "confirmed_unreachable",
+            error=_short_error(f"{type(exc).__name__}: {exc}"),
         )
 
     success_count, median, jitter, success_rate = summarize_samples(samples)
@@ -1847,7 +2016,11 @@ def test_node(node: Node, xray_bin: str, settings: Settings) -> TestResult:
     else:
         reason = "ok"
     stable_enough = reason == "ok"
-    return TestResult(
+    last_failure = next(
+        (sample.reason for sample in reversed(samples) if not sample.ok and sample.reason),
+        "",
+    )
+    result = TestResult(
         node.fingerprint,
         stable_enough,
         success_count,
@@ -1856,7 +2029,16 @@ def test_node(node: Node, xray_bin: str, settings: Settings) -> TestResult:
         jitter,
         success_rate,
         reason,
+        error="" if stable_enough else _short_error(last_failure),
     )
+    if stable_enough and exit_geo is not None:
+        result.exit_country = exit_geo.country_code
+        result.exit_ip = exit_geo.ip
+        result.exit_country_name = exit_geo.country_name
+        result.exit_city = exit_geo.city
+        result.geo_city_confident = exit_geo.city_confident
+        result.exit_city_source = exit_geo.city_source
+    return result
 
 
 def assess_stream_quality(
@@ -2284,6 +2466,15 @@ def quality_for_speed(speed: float | None, settings: Settings) -> str:
     return "poor"
 
 
+def uncertain_streak_of(record: dict[str, Any] | None) -> int:
+    if not isinstance(record, dict):
+        return 0
+    try:
+        return max(0, int(record.get("stream_uncertain_streak", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def previous_stream_is_trusted(
     record: dict[str, Any] | None, settings: Settings
 ) -> bool:
@@ -2320,18 +2511,26 @@ def apply_stream_result(
         result.stream_bytes_downloaded = stream.bytes_downloaded
         result.stream_deep_tested = stream.deep_tested
         result.stream_quality = stream.quality
-        result.exit_country = stream.exit_country
-        result.exit_ip = stream.exit_ip
-        result.exit_country_name = stream.exit_country_name
-        result.exit_city = stream.exit_city
-        result.geo_city_confident = stream.geo_city_confident
-        result.exit_city_source = stream.exit_city_source
+        # Keep the egress location found during the health test when the
+        # transfer test could not observe one (for example a Cloudflare trace
+        # that a Workers-based node cannot reach).
+        if stream.exit_ip is not None or stream.exit_country is not None:
+            result.exit_country = stream.exit_country
+            result.exit_ip = stream.exit_ip
+            result.exit_country_name = stream.exit_country_name
+            result.exit_city = stream.exit_city
+            result.geo_city_confident = stream.geo_city_confident
+            result.exit_city_source = stream.exit_city_source
 
     if result.stream_quality in {"strong", "good"}:
         return
-    retry_failed_independently = (
-        stream is not None and stream.reason == "stream_multi_endpoint_failed"
-    )
+    if stream is None:
+        # The node passed every real HTTPS health probe, but the byte/time
+        # budget did not allow a transfer test in this scan. Missing evidence
+        # is not evidence of failure: publish it provisionally (it ranks below
+        # verified nodes) and let rotation test it in a later scan.
+        return
+    retry_failed_independently = stream.reason == "stream_multi_endpoint_failed"
     previous_uncertain_streak = (
         int(previous.get("stream_uncertain_streak", 0) or 0)
         if isinstance(previous, dict)
@@ -2343,12 +2542,30 @@ def apply_stream_result(
         else 0
     )
     weak_single_sample = (
-        stream is not None
-        and stream.completed < 2
+        stream.completed < 2
         and stream.stalls == 0
         and not stream.confirmed_slow
         and stream.reason == "stream_below_target"
     )
+    inconclusive_transfer = (
+        result.stream_quality == "unverified"
+        and stream.reason == "stream_unverified"
+        and stream.completed == 0
+        and stream.stalls == 0
+        and not stream.confirmed_slow
+    )
+    if (
+        inconclusive_transfer
+        and not retry_failed_independently
+        and previous_uncertain_streak < INCONCLUSIVE_STREAM_LIMIT
+    ):
+        # No endpoint finished a transfer and nothing stalled: typically a
+        # Cloudflare-hosted speed endpoint that a Workers-based node cannot
+        # reach, or a budget that ran out before the independent retry. The
+        # node still answered real HTTPS requests, so it stays published while
+        # it gets priority for an independent retry; repeated inconclusive
+        # scans eventually count as a failure.
+        return
     if (
         (
             (
@@ -2366,10 +2583,7 @@ def apply_stream_result(
         return
 
     result.passed = False
-    if stream is not None:
-        result.reason = stream.reason
-    else:
-        result.reason = "stream_unverified"
+    result.reason = stream.reason
 
 
 def deep_test_priority(
@@ -2412,9 +2626,18 @@ def followup_stream_test_plan(
     primary_count: int,
     retry_needed_count: int,
     settings: Settings,
+    primary_used_bytes: int | None = None,
 ) -> tuple[int, int, int]:
-    """Return retry count, deep count and total bytes without crossing the cap."""
+    """Return retry count, deep count and total bytes without crossing the cap.
+
+    ``primary_used_bytes`` is what the primary transfers really downloaded.
+    Transfers that fail early download almost nothing, and counting their full
+    planned size would starve exactly the independent retries those failures
+    need. It can never exceed the planned size, so the cap still holds.
+    """
     primary_bytes = primary_count * settings.speed_test_bytes
+    if primary_used_bytes is not None:
+        primary_bytes = min(primary_bytes, max(0, int(primary_used_bytes)))
     remaining = max(0, settings.speed_budget_bytes - primary_bytes)
     retry_count = min(
         max(0, retry_needed_count), remaining // settings.speed_test_bytes
@@ -2571,11 +2794,16 @@ def make_record(
         if isinstance(previous, dict)
         else 0
     )
-    uncertain_streak = (
-        previous_uncertain_streak + 1
-        if result.stream_quality == "unverified"
-        else 0
-    )
+    # Only scans in which a transfer was actually attempted count; a scan that
+    # skipped the transfer test says nothing about the node either way.
+    if result.stream_attempts > 0:
+        uncertain_streak = (
+            previous_uncertain_streak + 1
+            if result.stream_quality == "unverified"
+            else 0
+        )
+    else:
+        uncertain_streak = previous_uncertain_streak
     verified = any(
         bool(item.get("deep"))
         and str(item.get("quality")) in {"strong", "good"}
@@ -2800,10 +3028,22 @@ def run(args: argparse.Namespace) -> int:
                 existing.source_ids.add(source.source_id)
                 existing.source_names.add(node.name)
 
-    if len(nodes) > settings.max_configs:
+    salt = rotation_salt()
+    candidate_limit_reached = len(nodes) > settings.max_configs
+    if candidate_limit_reached:
+        # Safety valve only (the default limit is far above real feed sizes).
+        # Published nodes always stay; the rest rotate every scan window so
+        # that no node is permanently excluded by its hash.
+        log(
+            f"Warning: {len(nodes)} unique configs exceed MAX_CONFIGS="
+            f"{settings.max_configs}; testing a rotating subset."
+        )
         prioritized = sorted(
             nodes.values(),
-            key=lambda item: (0 if item.fingerprint in previous_nodes else 1, item.fingerprint),
+            key=lambda item: (
+                0 if item.fingerprint in previous_nodes else 1,
+                rotation_key(item.fingerprint, salt),
+            ),
         )[: settings.max_configs]
         nodes = {item.fingerprint: item for item in prioritized}
 
@@ -2812,25 +3052,60 @@ def run(args: argparse.Namespace) -> int:
         f"({unsupported} unsupported, {invalid} invalid)."
     )
 
+    previous_selected_set = set(previous_selected)
     ordered_nodes = sorted(
         nodes.values(),
         key=lambda item: (
-            0 if item.fingerprint in previous_selected else 1,
+            0 if item.fingerprint in previous_selected_set else 1,
             float(previous_nodes.get(item.fingerprint, {}).get("latency_ms") or 99_999),
-            item.fingerprint,
+            rotation_key(item.fingerprint, salt),
         ),
     )
 
     results: dict[str, TestResult] = {}
     deadline = started + settings.max_scan_seconds
+    # The health phase gets only part of the time budget so that the transfer
+    # tests always have time left to run.
+    health_deadline = started + int(
+        settings.max_scan_seconds * settings.health_phase_fraction
+    )
+
+    tcp_rejected = 0
+    tcp_endpoints_checked = 0
+    if ordered_nodes and settings.tcp_prefilter:
+        tcp_failed, tcp_endpoints_checked = tcp_prefilter(
+            ordered_nodes,
+            set(previous_selected_set) | set(previous_nodes),
+            settings,
+        )
+        for fingerprint, label in tcp_failed.items():
+            results[fingerprint] = TestResult(
+                fingerprint,
+                False,
+                0,
+                1,
+                None,
+                None,
+                0.0,
+                "confirmed_unreachable",
+                error=f"tcp connect failed: {label}",
+            )
+        tcp_rejected = len(tcp_failed)
+        log(
+            f"TCP prefilter: {tcp_endpoints_checked} endpoints checked, "
+            f"{tcp_rejected} configs rejected as unreachable."
+        )
+        ordered_nodes = [
+            item for item in ordered_nodes if item.fingerprint not in tcp_failed
+        ]
+
+    health_scheduled = len(ordered_nodes)
+    pending: dict[concurrent.futures.Future[TestResult], Node] = {}
     if ordered_nodes:
         log(f"Testing configs with {settings.scan_workers} parallel workers...")
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=settings.scan_workers)
-        pending: dict[concurrent.futures.Future[TestResult], Node] = {}
         try:
             for node in ordered_nodes:
-                if time.monotonic() >= deadline:
-                    break
                 pending[executor.submit(test_node, node, xray_bin, settings)] = node
             completed_count = 0
             for future in concurrent.futures.as_completed(pending):
@@ -2840,28 +3115,48 @@ def run(args: argparse.Namespace) -> int:
                 if completed_count % 50 == 0 or completed_count == len(pending):
                     passed_so_far = sum(1 for item in results.values() if item.passed)
                     log(f"Tested {completed_count}/{len(pending)}; passed: {passed_so_far}")
-                if time.monotonic() >= deadline:
+                if time.monotonic() >= health_deadline:
                     for item in pending:
                         item.cancel()
                     break
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
+    # Results that finished while the pool was shutting down are still valid.
+    for future, node in pending.items():
+        if future.done() and not future.cancelled() and node.fingerprint not in results:
+            try:
+                finished = future.result()
+            except Exception:
+                continue
+            results[finished.fingerprint] = finished
+    health_not_tested = max(
+        0, health_scheduled - sum(1 for node in ordered_nodes if node.fingerprint in results)
+    )
+    if health_not_tested:
+        log(
+            f"Warning: {health_not_tested} configs were not tested because the "
+            "health-phase time budget ended."
+        )
+
+    error_counts = collections.Counter(
+        re.sub(r"\d{2,}", "#", result.error)
+        for result in results.values()
+        if not result.passed and result.error
+    )
+    for message, count in error_counts.most_common(10):
+        log(f"Rejection cause x{count}: {message}")
 
     passed_results = [result for result in results.values() if result.passed]
     health_passed_current = len(passed_results)
     quick_count = initial_stream_test_count(len(passed_results), settings)
+    # Published nodes are always re-checked first. The remaining healthy nodes
+    # rotate every scan window, so a healthy node is never left without a
+    # transfer test indefinitely just because of its latency or hash.
     speed_candidates = sorted(
         passed_results,
         key=lambda item: (
-            0 if item.fingerprint in previous_selected else 1,
-            0
-            if previous_stream_is_trusted(
-                previous_nodes.get(item.fingerprint), settings
-            )
-            else 1,
-            item.latency_ms or 99_999,
-            item.jitter_ms or 99_999,
-            item.fingerprint,
+            0 if item.fingerprint in previous_selected_set else 1,
+            rotation_key(item.fingerprint, salt),
         ),
     )[:quick_count]
     primary_outcomes: dict[str, StreamTestResult] = {}
@@ -2901,11 +3196,20 @@ def run(args: argparse.Namespace) -> int:
                 previous_nodes.get(item.fingerprint), settings
             )
             else 1,
+            # Nodes that already had inconclusive transfers get the independent
+            # retry first, so they are resolved before the streak limit hits.
+            -uncertain_streak_of(previous_nodes.get(item.fingerprint)),
             deep_test_priority(item, previous_nodes.get(item.fingerprint)),
         ),
     )
+    primary_used_bytes = sum(
+        outcome.bytes_downloaded for outcome in primary_outcomes.values()
+    )
     retry_slots, deep_slots, planned_stream_bytes = followup_stream_test_plan(
-        len(speed_candidates), len(retry_needed), settings
+        len(speed_candidates),
+        len(retry_needed),
+        settings,
+        primary_used_bytes=primary_used_bytes if primary_outcomes else None,
     )
     retry_candidates = retry_needed[:retry_slots]
     retry_fingerprints = {item.fingerprint for item in retry_candidates}
@@ -2997,7 +3301,11 @@ def run(args: argparse.Namespace) -> int:
     deep_fingerprints = {item.fingerprint for item in deep_candidates}
     deep_outcomes: dict[str, StreamTestResult] = {}
     planned_stream_bytes = (
-        len(speed_candidates) * settings.speed_test_bytes
+        (
+            min(len(speed_candidates) * settings.speed_test_bytes, primary_used_bytes)
+            if primary_outcomes
+            else len(speed_candidates) * settings.speed_test_bytes
+        )
         + len(retry_candidates) * settings.speed_test_bytes
         + len(deep_candidates) * settings.stream_test_bytes
     )
@@ -3272,6 +3580,15 @@ def run(args: argparse.Namespace) -> int:
             "grace_retained": grace_count,
             "published": len(selected),
             "broken_or_rejected": broken_total,
+            "provisional_published": sum(
+                1
+                for record in selected
+                if str(record.get("stream_quality", "unverified")) == "unverified"
+            ),
+            "tcp_prefilter_endpoints": tcp_endpoints_checked,
+            "tcp_prefilter_rejected": tcp_rejected,
+            "health_not_tested": health_not_tested,
+            "candidate_limit_reached": candidate_limit_reached,
         },
         "broken": {
             "total": broken_total,
@@ -3306,6 +3623,10 @@ def run(args: argparse.Namespace) -> int:
                     "stream_multi_endpoint_failed",
                 )
             ),
+            "top_errors": [
+                {"error": message, "count": count}
+                for message, count in error_counts.most_common(10)
+            ],
             "note": "Duplicates are not counted as broken; unsupported external protocols are not extracted by this scanner.",
         },
         "quality": {
